@@ -53,7 +53,7 @@ This is bad since:
 * Overhead in data transfer between devices
 * Shared embeddings may need to be copied between GPUs (think llms with weight sharing)
 
-image address for PP diagram: https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parallelism-gpipe-bubble.png
+![alt text](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parallelism-gpipe-bubble.png)
 
 Instead of each GPU operating on a single chunk in a mutually exclusive fashion, we can micro-batch the inputs and each GPU can concurrently work on their own micro-batch in the forward and backwards pass. This is pipeline parallelism (PP). There's still some downtime known as the "bubble" where GPU's are waiting for the results in the fwds and bkwds passes. The goal is to minimize the size of the bubble.
 
@@ -63,8 +63,7 @@ In practice though, PP is fast.
 ## Tensor parallelism 
 Give each GPU a slice of a some weights. It seeems counter-intuitive at first, but at the end of the day its just basic linear algebra
 
-(rending this might not work)
-https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parallelism-tp-parallel\_gemm.png
+![alt text](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parallelism-tp-parallel\_gemm.png)
 
 If we split the weight matrix A column-wise across N GPUs and perform matrix multiplications XA\_1 through XA\_n in parallel, then we will end up with N output vectors Y\_1, Y\_2, ..., Y\_n which can be fed into GeLU independently -> Y = [GELU(Y\_1), ..., GELU(Y\_n)]
 
@@ -78,7 +77,7 @@ From the llama3.1 paper:
 
 ## multi-dimensional parallelism 
 TP, DP, and PP aren't mutually exclusive. By choosing different combinations of parallelism we can achieve higher spedeups. 
-https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parallelism-deepspeed-3d.png
+![alt text](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parallelism-deepspeed-3d.png)
 
 # Single-node multi-GPU setup tips
 
