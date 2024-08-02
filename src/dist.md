@@ -76,7 +76,8 @@ From the llama3.1 paper:
 
 
 ## multi-dimensional parallelism 
-TP, DP, and PP aren't mutually exclusive. By choosing different combinations of parallelism we can achieve higher spedeups. 
+TP, DP, and PP aren't mutually exclusive. By choosing different combinations of parallelism we can achieve higher speedups. 
+
 ![alt text](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parallelism-deepspeed-3d.png)
 
 # Single-node multi-GPU setup tips
@@ -87,7 +88,7 @@ Model fits onto a single GPU:
 
 Model doesn’t fit onto a single GPU:
 * PP
-* ZeRO
+* ZeRO (or FSDP)
 * TP
 
 With very fast intra-node connectivity of NVLINK or NVSwitch all three should be mostly on par, without these PP will be faster than TP or ZeRO. The degree of TP may also make a difference. Best to experiment to find the winner on your particular setup.

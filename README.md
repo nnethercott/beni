@@ -1,19 +1,26 @@
 # beni 
-some useful repos:
+## resources
+### repos
 * [llama-recipes](https://github.com/meta-llama/llama-recipes) (fsdp tools, activation checkpointing, mixed precision, wrapper for lora, overall holy grail)
 * [TinyLlama](https://github.com/jzhang38/TinyLlama) (system monitor for tracking gpu usage)
 * [llava](https://github.com/haotian-liu/LLaVA)
 * [cambrian](https://github.com/cambrian-mllm/cambrian) (vision projector design)
 * [dragonfly](https://github.com/togethercomputer/Dragonfly) (multi crop vision)
 
-timeline:
-- [ ] run *fsdp* fine tuning on [tiny_shakespeare](https://huggingface.co/datasets/karpathy/tiny_shakespeare) to check it works, (change config.num_layers for small llama)
+### other 
+* [estimating transformer FLOPs](https://www.adamcasson.com/posts/transformer-flops)
 
+### vlm design next steps
+* read llama3 paper section on this
+* copy CA block from idefics? or just use llama decoder layer ... 
 
-features to implement:
-- [ ] [resource monitor](https://github.com/jzhang38/TinyLlama/blob/bf122247c486b6b897050e98cbb7bedae8eeba73/lit_gpt/speed_monitor.py#L15) to determine if code memory or compute bound 
-- [x] checkpointing/loading for fsdp  
-- [ ] mixed precision (newer architectures get huge speedups here too)
-- [ ] **LoRA in fsdp**
-- [ ] mixed precision & scaler 
-- [ ] **activation checkpointing**
+## general todo:
+- [x] run fsdp fine tuning on [tiny_shakespeare](https://huggingface.co/datasets/karpathy/tiny_shakespeare) as sanity check 
+    * full ft + lora, model checkpointing
+- [x] setup gpu profiling 
+    * extremely low mfu, might be since we're using huggingface models
+- [ ] convert to using llama-recipes training framework
+- [ ] add alt quantization schemes (e.g. HQQ) to `src/configs/quantization.py`
+- [ ] explore/add DLoRA 
+- [ ] play around with sequence packing in train
+- [ ] custom finetune script based on llama-recipes (for some reason their's is slower than ours so far, maybe reduction ops?)
