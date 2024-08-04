@@ -34,7 +34,7 @@ def sft_collate_fn(inputs, tok):
     )
     attn_mask = (pos < seq_end).to(dtype=torch.float32)
 
-    # TODO: add mask for prompt tokens as in pico
+    # TODO: add mask for prompt tokens as in picogpt
     labels = input_ids_t.masked_fill(attn_mask == 0, -100)
 
     return {
