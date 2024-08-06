@@ -110,13 +110,13 @@ class Beni(nn.Module):
         p = CLIPImageProcessor.from_pretrained(config.vision_name_or_path)
         self.vision = VisionTower(v, p, config.r)
 
-        # connector
-        self.connector = Connector(self.vision_config.hidden_size, self.text_config.hidden_size)
 
         # text -- maybe turn into module like `vision`
         self.llm = AutoModelForCausalLM.from_pretrained(config.llm_name_or_path, attn_implementation=config.attn_implementation,)
         self.tok = AutoTokenizer.from_pretrained(config.llm_name_or_path)
         self.tok.padding_side = 'right'
+
+        self.connector = Connector(self.vision_config.hidden_size, self.text_config.hidden_size)
 
 
         # freeze 
@@ -124,15 +124,9 @@ class Beni(nn.Module):
             self.freeze()
 
     def freeze(self):
-        # text
-        self.llm.eval()
-        for p in self.llm.parameters():
-            p.requires_grad = False
-
-        # vision
-        self.vision.eval()
-        for p in self.vision.parameters():
-            p.requires_grad = False
+        for n,p in model.named_parameters:
+            if 'connector' in n:
+                p.requires_grad = False
 
 
     @property
@@ -294,17 +288,19 @@ if __name__ == "__main__":
     )
         
     beni = Beni(cfg)
+    beni.llm.enable_input_require_grads()
+
     params = sum(p.numel() for p in beni.parameters())
     trainable = sum(p.numel() if p.requires_grad else 0 for p in beni.parameters())
     print(f'VLM with: {params/1e9:.1f}B params | {100*trainable/params:.2f}% trainable')
 
     beni.to("cuda")
 
-    params = {
-        "params": [p for p in model.connector.parameters() if p.requires_grad],
-        "weight_decay": train_config.weight_decay,
-        "lr": train_config.lr,
-    }
+    params = [{
+        "params": [p for p in beni.connector.parameters()],
+        "weight_decay": 0.1,
+        "lr": 1e-3,
+    }]
     optimizer = torch.optim.AdamW(
         params,
     )
@@ -319,13 +315,13 @@ if __name__ == "__main__":
 
     out = beni(**inputs)
 
-    projector_clone = [p.clone() for p in beni.connector.parameters()]
-
     loss = out['loss']
-    loss.requires_grad = True
     loss.backward()
+
+    for p in beni.connector.parameters():
+        print(p.grad)
+    
     optimizer.step()
     optimizer.zero_grad()
 
-    projector = [p.clone() for p in beni.connector.parameters()]
 
