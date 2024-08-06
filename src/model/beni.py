@@ -1,10 +1,13 @@
 from dataclasses import dataclass
 from typing import Callable, Optional, List, Tuple, Union
 from PIL import Image
+import functools
+import os
 
 import torch 
 from torch import nn 
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from transformers import(
     CLIPImageProcessor, 
@@ -18,13 +21,19 @@ from transformers import(
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from datasets import load_dataset
 
 """
 NOTES: 
     * ideally: Beni(text_config, vision_config)
         * need some hf utils to find the right vision classes to load vision tower
 """
+
+def rank_0_only(f):
+    def wrap(*args, **kwargs):
+        if not torch.distributed.is_initialized() or int(os.environ['LOCAL_RANK']) == 0:
+            return f(*args, **kwargs)
+    return wrap
+
 
 class VisionTower(nn.Module):
     """
@@ -39,6 +48,7 @@ class VisionTower(nn.Module):
         self.vision = vision 
         self.processor = processor
         self.r = r 
+        self.feature_select_index = -1
 
         # update self.vision.config 
         setattr(self.vision.config, 'hidden_size', r*self.vision.config.hidden_size)
@@ -56,7 +66,7 @@ class VisionTower(nn.Module):
        x = self.processor(x, return_tensors = 'pt')['pixel_values']
        
        x = self.vision(x.to(self.device), output_hidden_states=True)
-       x = x['hidden_states'][-1][:,1:,:]
+       x = x['hidden_states'][self.feature_select_index][:,1:,:]
        b,s,d = x.shape
 
        # concatenate adjacent tokens a la minigpt4-v2
@@ -78,18 +88,18 @@ class Connector(nn.Module):
         return self.proj(self.norm(x))
 
 
-# todo: make a real beniconfig
 @dataclass 
 class BeniConfig:
     vision_name_or_path: str = None
     llm_name_or_path: str = None
     r: int = 4
+    freeze: bool = True # whether or not to freeze llm and vision
+    attn_implementation: str = "sdpa" # should be able to switch this for flash attn i hope (same for clip?)
 
-# language now?
+
 class Beni(nn.Module):
     """
     todo: 
-        - projector layer missing
     """
     def __init__(self, config: BeniConfig):
         super().__init__()
@@ -104,9 +114,26 @@ class Beni(nn.Module):
         self.connector = Connector(self.vision_config.hidden_size, self.text_config.hidden_size)
 
         # text -- maybe turn into module like `vision`
-        self.llm = AutoModelForCausalLM.from_pretrained(config.llm_name_or_path)
+        self.llm = AutoModelForCausalLM.from_pretrained(config.llm_name_or_path, attn_implementation=config.attn_implementation,)
         self.tok = AutoTokenizer.from_pretrained(config.llm_name_or_path)
         self.tok.padding_side = 'right'
+
+
+        # freeze 
+        if self.config.freeze:
+            self.freeze()
+
+    def freeze(self):
+        # text
+        self.llm.eval()
+        for p in self.llm.parameters():
+            p.requires_grad = False
+
+        # vision
+        self.vision.eval()
+        for p in self.vision.parameters():
+            p.requires_grad = False
+
 
     @property
     def text_config(self):
@@ -114,10 +141,35 @@ class Beni(nn.Module):
     @property
     def vision_config(self):
         return self.vision.config
+    @property
+    def img_token(self):
+        return self.tok.encode("<img>", add_special_tokens=False)
+    @property
+    def end_img_token(self):
+        return self.tok.encode("<\img>", add_special_tokens=False)
 
     @property
     def device(self):
         return self.vision.device
+
+    def pretty_print(self):
+        params = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() if p.requires_grad else 0 for p in self.parameters())
+
+        if dist.is_initialized():
+            params = torch.tensor(params, device="cuda") # dist group is nccl
+            trainable = torch.tensor(trainable, device="cuda")
+
+            # reduce on rank 0 and print
+            dist.reduce(params, 0, op=dist.ReduceOp.SUM)
+            dist.reduce(trainable, 0, op=dist.ReduceOp.SUM)
+
+            if int(os.environ["LOCAL_RANK"]) == 0: #turn this into a `is_rank_0` function?
+                print(f'VLM with: {params.item()/1e9:.1f}B params | {100*trainable.item()/params.item():.2f}% trainable\n')
+                print(self)
+        else:
+            print(f'VLM with: {params/1e9:.1f}B params | {100*trainable/params:.2f}% trainable\nprint_trainable_parameters')
+            print(self)
 
     def prepare_batch_if_images(
         self,
@@ -143,10 +195,10 @@ class Beni(nn.Module):
             sos_embeddings = text_embeddings[:,1,:].unsqueeze(1)
             
             # embed <img> and </img>
-            img_token = torch.tensor(self.tok.encode("<img>", add_special_tokens=False), device=self.device).unsqueeze(0)
+            img_token = torch.tensor(self.img_token, device=self.device).unsqueeze(0)
             img_embeds = self.llm.model.embed_tokens(img_token).repeat((bsz,1,1))
 
-            end_img_token = torch.tensor(self.tok.encode("</img>", add_special_tokens=False), device=self.device).unsqueeze(0)
+            end_img_token = torch.tensor(self.end_img_token, device=self.device).unsqueeze(0)
             end_img_embeds = self.llm.model.embed_tokens(end_img_token).repeat((bsz,1,1))
 
             #<s><img>insert_image_featuers<img>prompt</s>
@@ -154,20 +206,22 @@ class Beni(nn.Module):
             input_ids = None  # ensure input_ids is not passed to the model
 
 
-            _, seq_len, _ = vision_embeddings.shape
+            _, vis_len, _ = vision_embeddings.shape
 
             # attention_mask
-            additional_len = len(self.tok.encode("<img>", add_special_tokens=False))
-            additional_len += len(self.tok.encode("</img>", add_special_tokens=False)) #TODO define these as property
-            attention_mask = torch.cat((torch.ones((bsz, seq_len+additional_len), device=self.device), attention_mask), dim=1)
+            additional_len = len(self.img_token) + len(self.end_img_token)
+            attention_mask = torch.cat((torch.ones((bsz, vis_len+additional_len), device=self.device), attention_mask), dim=1)
 
             
             # if we're computing loss
             if labels is not None:
-                labels = labels[:,1:] #need to get rid of <s> since we don't wanna predict <s> after </img> 
+                labels = labels[:,1:] #need to get rid of <s> since we're about to concatenate a prefix with img tokens 
                 additional_len+=1 #<s> we just got rid of^
-                labels_prefix = torch.tensor([-100]*(seq_len+additional_len), device = self.device)
-                labels_prefix = labels_prefix.repeat((bsz, 1))
+                labels_prefix = torch.tensor([-100]*(vis_len+additional_len), device = self.device)
+
+                # IMPORTANT 
+                # NOTE: this assumes all samples in batch have same number of image tokens -- in future generalize
+                labels_prefix = labels_prefix.repeat((bsz, 1)) 
 
                 labels = torch.cat((labels_prefix, labels), dim=1)
 
@@ -193,20 +247,19 @@ class Beni(nn.Module):
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None, # in reality these are pil images
         return_dict: Optional[bool] = None,
+        **kwargs, #debug
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         """
-        Notes:
-            * modify attention mask to be bidirectional over image tokens
-            * add -100s for image tokens
+        passes input embeddings directly to llm if images present. otherwise use input_ids
         """
-
         assert input_ids is not None or images is not None, "You can't forward without text and/or images!"
 
         # only if images do we modify & pad
         if images is not None:
                 input_ids, attention_mask, inputs_embeds, labels = self.prepare_batch_if_images(input_ids, attention_mask, inputs_embeds, labels, images)
             
+        #print(kwargs)
         #print(attention_mask)
         #print(self.tok.batch_decode(labels.masked_fill(labels==-100, 100)))
 
@@ -224,35 +277,55 @@ class Beni(nn.Module):
         )
 
 
-
 if __name__ == "__main__":
+    from datasets import load_dataset
+    import sys
+    sys.path.insert(1, "../")
+    from d import *
+
     VISION_MODEL_ID = "openai/clip-vit-large-patch14"
     TEXT_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-
-    mnist = load_dataset('ylecun/mnist', split='train')
-    samples = [i for i in mnist['image'][:2]]
 
     cfg = BeniConfig(
         vision_name_or_path = VISION_MODEL_ID,
         llm_name_or_path = TEXT_MODEL_ID,
-        r = 16
+        r = 16,
+        freeze = True,
     )
         
     beni = Beni(cfg)
+    params = sum(p.numel() for p in beni.parameters())
+    trainable = sum(p.numel() if p.requires_grad else 0 for p in beni.parameters())
+    print(f'VLM with: {params/1e9:.1f}B params | {100*trainable/params:.2f}% trainable')
+
     beni.to("cuda")
 
-    tok = beni.tok
+    params = {
+        "params": [p for p in model.connector.parameters() if p.requires_grad],
+        "weight_decay": train_config.weight_decay,
+        "lr": train_config.lr,
+    }
+    optimizer = torch.optim.AdamW(
+        params,
+    )
 
-    print(f'VLM with: {sum(p.numel() for p in beni.parameters())/1e9:.1f}B params')
-
-    sequences = ["once upon a time ", "long ago in a galaxy far far away"] 
-    inputs = tok([s+tok.eos_token for s in sequences], return_tensors = 'pt', padding=True)
-    inputs['labels'] = inputs['input_ids']
+    ds = load_recap(beni.tok, 100)
+    dl = torch.utils.data.DataLoader(ds, batch_size = 2, collate_fn = functools.partial(sft_collate_fn, tok=beni.tok))
+    inputs = next(iter(dl))
 
     for k, v in inputs.items():
         if isinstance(v, torch.Tensor):
             inputs[k] = v.to(beni.device)
 
-    inputs = {**inputs, 'images': samples}
-
     out = beni(**inputs)
+
+    projector_clone = [p.clone() for p in beni.connector.parameters()]
+
+    loss = out['loss']
+    loss.requires_grad = True
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+    projector = [p.clone() for p in beni.connector.parameters()]
+

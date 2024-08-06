@@ -2,6 +2,8 @@ import random
 import functools
 import os
 import time
+from dataclasses import dataclass, field
+from typing import Optional, List 
 
 import torch
 import torch.distributed as dist
@@ -27,7 +29,10 @@ from torch.distributed.fsdp.wrap import (
 )
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.clip.modeling_clip import CLIPEncoderLayer
+
 from peft import LoraConfig, get_peft_model
 
 # local 
@@ -35,17 +40,12 @@ from d import *
 from policies.wrapping import fsdp_auto_wrap_policy, get_llama_wrapper
 from utils.train_utils import clear_gpu_cache, setup_environ_flags
 
-from model import Beni
+from model import Beni, BeniConfig
 
-# make this a constant 
 def seed_everything(seed=0):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     random.seed(seed)
-
-
-model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 
 def setup():
@@ -56,43 +56,56 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def fsdp_main(model_config, train_config, fsdp_config):
+@dataclass
+class TrainConfig:
+    n_epochs: int = 1 
+    warmup_ratio: float = 0.03
+    batch_size: int = 16
+    gradient_accumulation_steps: int = 1
+    save_steps: int = 100
+    log_steps: int = 1
+    grad_clip: Optional[float] = 1.0
+    weight_decay: float = 0.0
+    lr: float = 1e-04
+    min_lr: float = 1e-05
+    betas: List = field(default_factory = lambda: [0.9, 0.999]),
+    wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None 
+    wandb_report: bool = False
+    ckpt_path: Optional[str] = None
+    save_path: Optional[str] = None
+
+
+def fsdp_main(model_config: BeniConfig, train_config: TrainConfig, fsdp_config):
     rank = int(os.getenv("LOCAL_RANK"))
     world_size = int(os.getenv("WORLD_SIZE"))
 
     # setup each cuda device ('device' aliased to cuda:n)
     if torch.distributed.is_initialized():
         torch.cuda.set_device(rank)
-        clear_gpu_cache(local_rank)
+        clear_gpu_cache(rank)
         setup_environ_flags(rank)
 
         seed_everything(rank)
 
-    # load model & tokenizer
-    tok = AutoTokenizer.from_pretrained(model_id)
-    config = AutoConfig.from_pretrained(model_id)
-    setattr(config, 'num_hidden_layers', 11)
-
-    
+    # load from rank 0 and broadcast weights
     if rank == 0:
-        model = AutoModelForCausalLM.from_config(
-            config,
-            attn_implementation="sdpa",
-        )
-        #model.load_state_dict(torch.load("tinyllama0.pt"))
+        model = Beni(model_config) # cpu
+
+        if train_config.ckpt_path is not None:
+            model.load_state_dict(torch.load(train_config.ckpt_path))
     else:
         with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(config, attn_implementation="sdpa")
-    
-    params = sum(p.numel() for p in model.parameters())
+            model = Beni(model_config)    
+            
     
     # LORA
     #peft_config = LoraConfig(r=8, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none')
     #model = get_peft_model(model, peft_config)
     #model.print_trainable_parameters()
     
-
-    my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, (LlamaDecoderLayer, ))
+    # TODO: make the below use fsdp_config
+    my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, (LlamaDecoderLayer, CLIPEncoderLayer))
     #my_auto_wrapping_policy = llama_autowrap_policy()
 
     model = FSDP(
@@ -111,42 +124,46 @@ def fsdp_main(model_config, train_config, fsdp_config):
     #    policies.apply_fsdp_checkpointing(model)
 
     dist.barrier()
-    if rank == 0:
-        print(model)
+    model.pretty_print()
         
     # optimizer
+    params = [{
+        "params": [p for p in model.connector.parameters() if p.requires_grad],
+        "weight_decay": train_config.weight_decay,
+        "lr": train_config.lr,
+    },]
     optimizer = torch.optim.AdamW(
-       model.parameters(),
-       lr=1e-04,
-       weight_decay=0.1,
+        params,
+       #betas=train_config.betas,
     )
 
     # do rank-specific shuffling before train launch
-    dl = DataLoader(
-        tiny_shakespeare(tok, slen=128), 
-        batch_size=1, 
-        num_workers = 1, 
-        collate_fn = functools.partial(sft_collate_fn, tok = tok), 
-        shuffle=True,
-        pin_memory=True,
-    )
+    ds = load_recap(model.tok, 100)
+    dl = DataLoader(ds, batch_size = train_config.batch_size, collate_fn = functools.partial(sft_collate_fn, tok=model.tok))
+    #dl = None
 
-    train(model, optimizer, dl)
+    train(model, optimizer, dl, train_config)
 
 
-def train(model, optimizer, dl, config):
+def train(model, optimizer, dl, train_config):
+    c = train_config
     model.train()
 
-    for i in range(epochs):
+    for i in range(c.n_epochs):
         for e, batch in enumerate(dl):
             tik = time.time()
-            for key in batch.keys():
-                batch[key] = batch[key].to(rank)
+            for k,v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to("cuda") #should be cuda:rank
 
             loss = model(**batch)['loss']
-            loss = loss / g
+            loss = loss / c.gradient_accumulation_steps
+            loss.requires_grad=True
             loss.backward()
             
+            if os.environ["LOCAL_RANK"] == '0':
+                for param in model.connector.parameters():
+                    print(param.grad)
            # if train_config.use_fp16:
            #     # if fp16 is enabled, use gradient scaler to handle gradient update
            #     scaler.scale(loss).backward()
@@ -156,9 +173,9 @@ def train(model, optimizer, dl, config):
            #         optimizer.zero_grad()
            #     loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), c.grad_clip)
 
-            if (e+1)%g==0:
+            if (e+1)%c.gradient_accumulation_steps==0:
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -167,6 +184,7 @@ def train(model, optimizer, dl, config):
 
             if os.environ["LOCAL_RANK"] == '0':
                 print(f"iter: {e}/{len(dl)} | loss: {loss.item()} | left: {(dt*(len(dl)-e)/60):.2f} [{dt:.2f}s/it]")
+
 
     # training done
     dist.barrier()
@@ -187,5 +205,22 @@ def train(model, optimizer, dl, config):
 
 if __name__ == "__main__":
     setup()
-    #fsdp_main()
+
+    VISION_MODEL_ID = "openai/clip-vit-large-patch14"
+    TEXT_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+    model_config = BeniConfig(
+        vision_name_or_path = VISION_MODEL_ID,
+        llm_name_or_path = TEXT_MODEL_ID,
+        r = 16,
+        freeze = True,
+    )
+    train_config = TrainConfig(
+        batch_size = 2,
+    )
+    fsdp_config = None
+
+    # launch train
+    fsdp_main(model_config, train_config, fsdp_config)
+
     cleanup()
