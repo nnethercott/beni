@@ -14,12 +14,15 @@
 * read llama3 paper section on this
 * copy CA block from idefics? or just use llama decoder layer ... 
 
+## roadmap:
+- [ ] get prompt templates working
+
 ## general todo:
 - [x] run fsdp fine tuning on [tiny_shakespeare](https://huggingface.co/datasets/karpathy/tiny_shakespeare) as sanity check 
     * full ft + lora, model checkpointing
 - [x] setup gpu profiling 
     * extremely low mfu, might be since we're using huggingface models
-- [ ] convert to using llama-recipes training framework
+- [x] convert to using llama-recipes training framework
 - [ ] add alt quantization schemes (e.g. HQQ) to `src/configs/quantization.py`
 - [ ] explore/add DLoRA 
 - [ ] play around with sequence packing in train

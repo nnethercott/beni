@@ -80,6 +80,8 @@ def fsdp_main(model_config: BeniConfig, train_config: TrainConfig, fsdp_config):
     rank = int(os.getenv("LOCAL_RANK"))
     world_size = int(os.getenv("WORLD_SIZE"))
 
+    seed_everything(rank)
+
     # setup each cuda device ('device' aliased to cuda:n)
     if torch.distributed.is_initialized():
         torch.cuda.set_device(rank)
@@ -104,8 +106,7 @@ def fsdp_main(model_config: BeniConfig, train_config: TrainConfig, fsdp_config):
     #model = get_peft_model(model, peft_config)
     #model.print_trainable_parameters()
     
-    # TODO: make the below use fsdp_config
-    my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, (LlamaDecoderLayer, CLIPEncoderLayer))
+    my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, (LlamaDecoderLayer, CLIPEncoderLayer)) # TODO: make this use fsdp_config
     #my_auto_wrapping_policy = llama_autowrap_policy()
 
     model = FSDP(
@@ -127,20 +128,21 @@ def fsdp_main(model_config: BeniConfig, train_config: TrainConfig, fsdp_config):
     model.pretty_print()
         
     # optimizer
-    params = [{
-        "params": [p for p in model.connector.parameters() if p.requires_grad],
-        "weight_decay": train_config.weight_decay,
-        "lr": train_config.lr,
-    },]
     optimizer = torch.optim.AdamW(
-        params,
-       #betas=train_config.betas,
+        model.parameters(),
+        lr=train_config.lr,
+        weight_decay=train_config.weight_decay,
+        betas=(0.999, 0.95),
     )
 
-    # do rank-specific shuffling before train launch
-    ds = load_recap(model.tok, 100)
-    dl = DataLoader(ds, batch_size = train_config.batch_size, collate_fn = functools.partial(sft_collate_fn, tok=model.tok))
-    #dl = None
+    # data
+    ds = load_recap(model.tok, 10000)
+    dl = DataLoader(ds, 
+                    batch_size = train_config.batch_size, 
+                    collate_fn = functools.partial(sft_collate_fn, tok=model.tok),
+                    shuffle=True,
+                    num_workers = 2,
+                    pin_memory=True)
 
     train(model, optimizer, dl, train_config)
 
@@ -156,26 +158,14 @@ def train(model, optimizer, dl, train_config):
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to("cuda") #should be cuda:rank
 
-            loss = model(**batch)['loss']
+            out = model(**batch, output_attentions=True) # inspect these !
+            loss = out['loss']
             loss = loss / c.gradient_accumulation_steps
-            loss.requires_grad=True
+            #loss.requires_grad = True
             loss.backward()
-            
-            if os.environ["LOCAL_RANK"] == '0':
-                for param in model.connector.parameters():
-                    print(param.grad)
-           # if train_config.use_fp16:
-           #     # if fp16 is enabled, use gradient scaler to handle gradient update
-           #     scaler.scale(loss).backward()
-           #     if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-           #         scaler.step(optimizer)
-           #         scaler.update()
-           #         optimizer.zero_grad()
-           #     loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), c.grad_clip)
 
             if (e+1)%c.gradient_accumulation_steps==0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), c.grad_clip)
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -183,8 +173,20 @@ def train(model, optimizer, dl, train_config):
             shape = batch['input_ids'].shape
 
             if os.environ["LOCAL_RANK"] == '0':
-                print(f"iter: {e}/{len(dl)} | loss: {loss.item()} | left: {(dt*(len(dl)-e)/60):.2f} [{dt:.2f}s/it]")
+                ## attention mask stuff
+                #a = torch.cat(out['attentions'], dim=0)
 
+                ## check avg attn in last layer
+                ##a = a[-1,:,-1,:].mean(0)
+                #a = a[:,:,-1,:].mean(dim=(0,1))
+                ## split into img and non-image and look at cumulative p 
+                #a = torch.nn.functional.softmax(a)
+                #img = a[:256//model.config.r]
+                #non_img = a[256//model.config.r:]
+
+                #metric = img.sum().item()/(len(img)/len(a))
+
+                print(f"iter: {e+1}/{len(dl)} | loss: {loss.item():.2f} | left: {(dt*(len(dl)-e)/60):.2f} | speed: {dt:.2f}s/it ") # |  img: {metric:.2f}
 
     # training done
     dist.barrier()
@@ -197,7 +199,7 @@ def train(model, optimizer, dl, train_config):
           ):
               cpu_state = model.state_dict()
               if rank == 0:
-                  torch.save(cpu_state, "shakespeare.pt")
+                  torch.save(cpu_state, "model.pt")
        
     else:
         model.save_pretrained("./")  
@@ -207,16 +209,19 @@ if __name__ == "__main__":
     setup()
 
     VISION_MODEL_ID = "openai/clip-vit-large-patch14"
-    TEXT_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    #TEXT_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    TEXT_MODEL_ID = "TinyLlama/TinyLlama_v1.1"
 
     model_config = BeniConfig(
         vision_name_or_path = VISION_MODEL_ID,
         llm_name_or_path = TEXT_MODEL_ID,
-        r = 16,
+        r = 4,
         freeze = True,
+        attn_implementation = "eager",
     )
     train_config = TrainConfig(
         batch_size = 2,
+        lr = 1e-03,
     )
     fsdp_config = None
 

@@ -4,6 +4,7 @@ from torch.utils.data import Dataset, DataLoader
 import os
 from typing import Callable
 import functools
+import random 
 
 # from concurrent.futures import ThreadPoolExecutor dataset.map uses concurrency already
 import requests
@@ -31,6 +32,7 @@ class CustomDataset(Dataset):
         return self.data[i]
 
 
+# TODO: use this to download images instead of dynamic get  
 class CustomDatasetForImages(CustomDataset):
     def __init__(self, data):
             super().__init__(data)
@@ -39,31 +41,29 @@ class CustomDatasetForImages(CustomDataset):
 
     #@override
     def __getitem__(self, i):
-        """
-        this is where the magic happens. if we can't load an image from its url
-        we increment offset and pop the bad sample
-
-        since we sort the dataset by seq length before train we'll load & clean images
-        from self.data
-        """
         img = None
         while img is None:
-            idx = min(i + self.offset, self.__len__()-1) # prevent indexing errors
+            #idx = min(i + self.offset, self.__len__()-1) # prevent indexing errors
+            idx = i+self.offset
+            if idx>= self.__len__():
+                # randomly see a previous example 
+                idx = random.randint(0, self.__len__())
+                #raise IndexError(f"Index {idx} out of range after {self.offset} failed downloads")
+
+
             url = self.data[idx]['url']
             try:
-                img = Image.open(io.BytesIO(requests.get(url).content)).convert('RGB')
-                break
+                tmp_img = Image.open(io.BytesIO(requests.get(url, timeout=3).content)).convert('RGB')
+                if len(tmp_img.size)==2 and tmp_img.size > (1,1):
+                    img = tmp_img
+                    break
             except: 
+                self.data.pop(idx) #dynamic length modify, should get rid of bad images later too
                 self.offset+=1
         return {**self.data[idx], 'images':img}
 
-
-    def purge(self):
-        """
-        method to remove bad images from self by iterating __getitem__
-        """
+    def build(self):
         pass
-
 
 def sft_collate_fn(inputs, tok):
     """
@@ -80,7 +80,7 @@ def sft_collate_fn(inputs, tok):
 
     # pad inputs and create attention mask
     input_ids_t = [
-        torch.tensor(i + [tok.pad_token_id] * (max_len - len(i))).unsqueeze(0)
+        torch.tensor(i + [tok.eos_token_id] * (max_len - len(i))).unsqueeze(0)
         for i in input_ids
     ]
     input_ids_t = torch.cat(input_ids_t, 0)
@@ -138,7 +138,8 @@ def tiny_shakespeare(tok, slen = 512):
 def load_data_from_generator(data: datasets.Dataset, 
                              tok, 
                              n: int = 100, 
-                             preprocess: Callable[[datasets.Dataset,],datasets.Dataset]=None):
+                             preprocess: Callable[[datasets.Dataset,],datasets.Dataset]=None,
+                             template = "{prompt}\n{response}</s>"):
     """
     Arguments:
         - data: lazy dataset loaded with `streaming=True`. dataset should have column 'response'. if no 'prompt' present we use ''
@@ -152,7 +153,6 @@ def load_data_from_generator(data: datasets.Dataset,
             - ensures free lunch with pure-text datasets, image ones handled by vlm 
     """
 
-    template = "{prompt}\n{response}"
 
     # load
     data = data.take(n)
@@ -168,14 +168,14 @@ def load_data_from_generator(data: datasets.Dataset,
     def process(samples):
         if 'prompt' in samples.keys():
             prompts = samples['prompt']
-            prompt_len = [len(tok.encode(p)) for p in prompts]
+            prompt_len = [len(tok.encode("{p}\n".format(p=p))) for p in prompts] #TODO: make this better
         else:
             prompts = ['']*len(samples['response'])
-            prompt_len = [0 for _ in prompts]
+            prompt_len = [0 for _ in prompts] # 1 for the <
 
         resp = samples['response']
         inputs = [template.format(prompt=p, response=r).strip() for p,r in zip(prompts,resp)]
-        input_ids = [tok.encode(i) + [tok.eos_token_id] for i in inputs]
+        input_ids = [tok.encode(i) for i in inputs]
 
         # NOTE: this doesn't consider the additional tokens coming from the template - e.g. "USER: {prompt}\nASSISTANT: {response}"
         
@@ -194,7 +194,7 @@ def load_data_from_generator(data: datasets.Dataset,
     return data
 
 
-def load_recap(tok, n):
+def load_recap(tok, n=100):
     """
     some samples won't download so we'll have to delete those
     """
@@ -212,10 +212,10 @@ def load_recap(tok, n):
         samples = samples.filter(lambda x: x['re_clip_score']>0.85)
         return samples
 
-    data = load_data_from_generator(data, tok, n=100, preprocess=None)
-
-    #return CustomDatasetForImages(data)
-    return data
+    data = load_data_from_generator(data, tok, n=n, preprocess=None)
+    data = data.to_list()
+    return CustomDatasetForImages(data)
+    #return CustomDataset(data)
 
 if __name__ == "__main__":
     from transformers import AutoTokenizer
