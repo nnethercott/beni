@@ -14,3 +14,7 @@ Disadvantages:
 
 We'll also **need** to sort rows by seq length to get better value and speed out of our gpus
 
+
+# idea:
+- setup dataset for distributed context; each process tries to download images then communicates to other ones the length of their dataset. take the min 
+    - add option for saving downloaded images or not (modify internal flag so behaviour on dataloader known at runtime)

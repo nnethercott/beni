@@ -171,7 +171,7 @@ class Beni(nn.Module):
             print(self)
 
 
-    def prepare_batch_if_images(
+    def prepare_inputs(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -180,28 +180,38 @@ class Beni(nn.Module):
         images: Optional[torch.FloatTensor] = None, # in reality these are pil images
         ): 
         """
+        TODO:
+            * handle case where input_embeds passed 
+
         NOTE: tokenizer right padding assumed for this to work
         * pad input_ids, attention_mask, and labels
         * need to decide on a prompt template 
             * <s><img>image_tokens_here</img>user_prompt_and_answer</s> ?
         """
 
+        if images is None:
+            return input_ids, attention_mask, inputs_embeds, labels
+
+        bsz = len(images)
+
         vision_embeds = self.vision(images)
         vision_embeds = self.connector(vision_embeds)
         
+        # bos
+        bos_token = torch.tensor(self.tok.bos_token_id, device=self.device).unsqueeze(0)
+        bos_embeds = self.llm.model.embed_tokens(bos_token).repeat((bsz,1,1))
+        
+        # embed <img> and </img>
+        img_token = torch.tensor(self.img_token, device=self.device).unsqueeze(0)
+        img_embeds = self.llm.model.embed_tokens(img_token).repeat((bsz,1,1))
+        end_img_token = torch.tensor(self.end_img_token, device=self.device).unsqueeze(0)
+        end_img_embeds = self.llm.model.embed_tokens(end_img_token).repeat((bsz,1,1))
+
         if input_ids is not None:
-            bsz, _ = input_ids.shape
             text_embeds = self.llm.model.embed_tokens(input_ids) 
-            sos_embeds = text_embeds[:,0,:].unsqueeze(1)
-            
-            # embed <img> and </img>
-            img_token = torch.tensor(self.img_token, device=self.device).unsqueeze(0)
-            img_embeds = self.llm.model.embed_tokens(img_token).repeat((bsz,1,1))
-            end_img_token = torch.tensor(self.end_img_token, device=self.device).unsqueeze(0)
-            end_img_embeds = self.llm.model.embed_tokens(end_img_token).repeat((bsz,1,1))
 
             #<s><img>insert_image_featuers<img>prompt</s>
-            inputs_embeds = torch.cat((sos_embeds, img_embeds, vision_embeds, end_img_embeds, text_embeds[:,1:,:]), dim=1)
+            inputs_embeds = torch.cat((bos_embeds, img_embeds, vision_embeds, end_img_embeds, text_embeds[:,1:,:]), dim=1)
             input_ids = None  # ensure input_ids is not passed to the model
 
             _, vis_len, _ = vision_embeds.shape
@@ -220,16 +230,14 @@ class Beni(nn.Module):
                 # IMPORTANT 
                 # NOTE: this assumes all samples in batch have same number of image tokens -- in future generalize
                 labels_prefix = labels_prefix.repeat((bsz, 1)) 
-
                 labels = torch.cat((labels_prefix, labels), dim=1)
 
-            #print(inputs_embeds.shape)
-            #print(attention_mask.shape)
-            #print(labels.shape)
 
-        # TODO: consider case when input_embeds passed
+        else:
+            inputs_embeds = torch.cat((bos_embeds, img_embeds, vision_embeds, end_img_embeds), dim=1)
+            attention_mask = torch.ones(inputs_embeds.shape[:-1], device=self.device)
 
-        return input_ids, attention_mask, inputs_embeds, labels
+        return None, attention_mask, inputs_embeds, labels
 
         
     def forward(
@@ -253,9 +261,7 @@ class Beni(nn.Module):
         """
         assert input_ids is not None or images is not None, "You can't forward without text and/or images!"
 
-        # only if images do we modify & pad
-        if images is not None:
-                input_ids, attention_mask, inputs_embeds, labels = self.prepare_batch_if_images(input_ids, attention_mask, inputs_embeds, labels, images)
+        input_ids, attention_mask, inputs_embeds, labels = self.prepare_inputs(input_ids, attention_mask, inputs_embeds, labels, images)
             
         #print(kwargs)
         #print(attention_mask)
@@ -307,6 +313,9 @@ class Beni(nn.Module):
         else:
             inputs_embeds = self.llm.model.embed_tokens(input_ids)
 
+        #print(inputs_embeds.shape)
+        #print(attention_mask.shape)
+
         return self.llm.generate(
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
@@ -333,23 +342,30 @@ if __name__ == "__main__":
     beni = Beni(cfg)
     beni.to("cuda")
     beni.pretty_print()
+    
 
     optimizer = torch.optim.AdamW(
         beni.parameters(),
         lr = 1e-03,
     )
 
-    ds = load_recap(beni.tok, 100)
-    dl = torch.utils.data.DataLoader(ds, batch_size = 2, collate_fn = functools.partial(sft_collate_fn, tok=beni.tok))
+    ds = load_recap(beni.tok, 10)
+    dl = torch.utils.data.DataLoader(ds, batch_size = 1, collate_fn = functools.partial(sft_collate_fn, tok=beni.tok))
     inputs = next(iter(dl))
 
     for k, v in inputs.items():
         if isinstance(v, torch.Tensor):
             inputs[k] = v.to(beni.device)
 
-    out = beni(**inputs)
+    inputs.pop('input_ids')
+    inputs.pop('url')
+    #inputs.pop('images')
+    #print(inputs)
 
-    loss = out['loss']
+    out = beni.generate(**inputs, max_new_tokens = 64)
+    print(beni.tok.batch_decode(out))
+
+    #loss = out['loss']
     #loss.backward()
 
     #for p in beni.connector.parameters():

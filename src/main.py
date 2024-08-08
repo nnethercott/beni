@@ -136,12 +136,12 @@ def fsdp_main(model_config: BeniConfig, train_config: TrainConfig, fsdp_config):
     )
 
     # data
-    ds = load_recap(model.tok, 10000)
+    ds = load_recap(model.tok, 100)
     dl = DataLoader(ds, 
                     batch_size = train_config.batch_size, 
                     collate_fn = functools.partial(sft_collate_fn, tok=model.tok),
                     shuffle=True,
-                    num_workers = 2,
+                    num_workers = 1,
                     pin_memory=True)
 
     train(model, optimizer, dl, train_config)
@@ -209,8 +209,8 @@ if __name__ == "__main__":
     setup()
 
     VISION_MODEL_ID = "openai/clip-vit-large-patch14"
-    #TEXT_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    TEXT_MODEL_ID = "TinyLlama/TinyLlama_v1.1"
+    TEXT_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    #TEXT_MODEL_ID = "TinyLlama/TinyLlama_v1.1"
 
     model_config = BeniConfig(
         vision_name_or_path = VISION_MODEL_ID,

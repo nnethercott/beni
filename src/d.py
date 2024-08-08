@@ -5,8 +5,9 @@ import os
 from typing import Callable
 import functools
 import random 
+from tqdm import tqdm 
 
-# from concurrent.futures import ThreadPoolExecutor dataset.map uses concurrency already
+from concurrent.futures import ThreadPoolExecutor 
 import requests
 from PIL import Image
 import io
@@ -34,36 +35,60 @@ class CustomDataset(Dataset):
 
 # TODO: use this to download images instead of dynamic get  
 class CustomDatasetForImages(CustomDataset):
-    def __init__(self, data):
+    def __init__(self, data, cache=True, request_timeout: float = 3.):
             super().__init__(data)
             self.offset = 0
-            #self.purge() # lets see what breaks first 
+            self.cache = cache
+            self.timeout = request_timeout
+
+            self.build() 
+            self.trim()
+
+    def get_image(self, url):
+        try:
+            return Image.open(io.BytesIO(requests.get(url, timeout=self.timeout).content)).convert('RGB')
+        except:
+            raise RuntimeError(f"image: {url} could not be downloaded !")
 
     #@override
     def __getitem__(self, i):
-        img = None
-        while img is None:
-            #idx = min(i + self.offset, self.__len__()-1) # prevent indexing errors
-            idx = i+self.offset
-            if idx>= self.__len__():
-                # randomly see a previous example 
-                idx = random.randint(0, self.__len__())
-                #raise IndexError(f"Index {idx} out of range after {self.offset} failed downloads")
-
-
-            url = self.data[idx]['url']
-            try:
-                tmp_img = Image.open(io.BytesIO(requests.get(url, timeout=3).content)).convert('RGB')
-                if len(tmp_img.size)==2 and tmp_img.size > (1,1):
-                    img = tmp_img
-                    break
-            except: 
-                self.data.pop(idx) #dynamic length modify, should get rid of bad images later too
-                self.offset+=1
-        return {**self.data[idx], 'images':img}
+        if self.cache:
+            return self.data[i] 
+        
+        img = self.get_image(i)
+        return {**self.data[i], 'images': img}
+        
 
     def build(self):
-        pass
+        urls_enumed = [(e,d['url']) for e,d in enumerate(self.data)]
+
+        def download(idx, url):
+            try:
+                img = self.get_image(url)
+                if not len(img.size)==2 or img.size[:2] == (1,1):  # edge cases
+                    return (idx, None)
+
+                if self.cache:
+                    self.data[idx] = {**self.data[idx], 'images': img}
+                return (idx, img)
+            except:
+                return (idx, None)
+
+        with ThreadPoolExecutor(max_workers = int(os.environ.get("OMP_NUM_THREADS", 4))) as executor:
+            res = list(tqdm(executor.map(lambda args: download(*args), urls_enumed), total=len(urls_enumed)))
+
+        # remove bad ids from data 
+        # nice leet code stuff 
+        bad_ids = [p[0] for p in res if p[1] is None]        
+        bad_ids = sorted(bad_ids)[::-1]
+        for idx in bad_ids:
+            self.data.pop(idx)
+
+    def trim(self):
+        if torch.distributed.is_initialized():
+            # broadcast self.data lengths and choose min 
+            pass
+
 
 def sft_collate_fn(inputs, tok):
     """
@@ -215,15 +240,13 @@ def load_recap(tok, n=100):
     data = load_data_from_generator(data, tok, n=n, preprocess=None)
     data = data.to_list()
     return CustomDatasetForImages(data)
-    #return CustomDataset(data)
 
 if __name__ == "__main__":
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    #d = tiny_shakespeare(tok)
 
     ds = load_recap(tok, 100)
-    dl = DataLoader(ds, batch_size = 4, collate_fn = functools.partial(sft_collate_fn, tok=tok))
-    batch = next(iter(dl))
+    #dl = DataLoader(ds, batch_size = 4, collate_fn = functools.partial(sft_collate_fn, tok=tok))
+    #batch = next(iter(dl))
     #print(batch)
     
