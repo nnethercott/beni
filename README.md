@@ -8,10 +8,10 @@
 * [dragonfly](https://github.com/togethercomputer/Dragonfly) (multi crop vision)
 * [minigptv](https://github.com/Vision-CAIR/MiniGPT-4) (concat of visual tokens, llava-style archi)
 
-### other 
+### papers and articles 
 * [estimating transformer FLOPs](https://www.adamcasson.com/posts/transformer-flops)
 * [making gpus go brrr](https://horace.io/brrr_intro.html)
-
+* [idefics2](https://arxiv.org/pdf/2405.02246)
 
 ## feature roadmap:
 * [x] convert to using llama-recipes training framework [25/07/24]
@@ -26,3 +26,5 @@
 * [ ] alt quantization schemes (e.g. HQQ) 
 * [ ] DLoRA 
 * [ ] play around with sequence packing in train
+* [ ] perceiver resampler to replace minigpt token concat?
+* [ ] interpolate positional embeddings for high res images in vision encoder

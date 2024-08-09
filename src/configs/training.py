@@ -1,7 +1,25 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional, List
+
+@dataclass
+class TrainConfig:
+    n_epochs: int = 1 
+    warmup_ratio: float = 0.03
+    batch_size: int = 16
+    gradient_accumulation_steps: int = 1
+    save_steps: int = 100
+    log_steps: int = 1
+    grad_clip: Optional[float] = 1.0
+    weight_decay: float = 0.0
+    lr: float = 1e-04
+    min_lr: float = 1e-05
+    betas: List = field(default_factory = lambda: [0.9, 0.999]),
+    ckpt_path: Optional[str] = None
+    save_path: Optional[str] = None
+    fsdp: Optional[bool] = True
 
 
 @dataclass

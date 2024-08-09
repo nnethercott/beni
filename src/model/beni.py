@@ -3,16 +3,17 @@ from typing import Callable, Optional, List, Tuple, Union
 from PIL import Image
 import functools
 import os
+import importlib 
 
 import torch 
 from torch import nn 
 import torch.nn.functional as F
 import torch.distributed as dist
 
+import transformers
 from transformers import(
-    CLIPImageProcessor, 
-    CLIPVisionModel, 
-    CLIPVisionConfig,
+    AutoModel,
+    AutoProcessor,
     PreTrainedModel, 
     AutoModelForCausalLM,
     AutoConfig,
@@ -45,14 +46,17 @@ class VisionTower(nn.Module):
     """
     def __init__(self, vision: PreTrainedModel, processor: Callable[[Image],torch.Tensor], r: int = 1):
         super().__init__()
-
         self.vision = vision 
-        self.processor = processor
-        self.r = r 
         self.feature_select_index = -1
+        self.r = r 
+
+        if hasattr(processor, "image_processor"):
+            self.processor = processor.image_processor  # instantiated with AutoProcessor 
+        else:
+            self.processor = processor 
 
         # update self.vision.config 
-        setattr(self.vision.config, 'hidden_size', r*self.vision.config.hidden_size)
+        setattr(self.config, 'hidden_size', r*self.vision.config.hidden_size)
         
     @property
     def device(self):
@@ -60,7 +64,11 @@ class VisionTower(nn.Module):
 
     @property
     def config(self):
-        return self.vision.config
+        # if model loaded with automodel 
+        if hasattr(self.vision.config, "vision_config"):
+            return self.vision.config.vision_config
+        else:
+            return self.vision.config
 
 
     def forward(self, x):
@@ -92,7 +100,10 @@ class Connector(nn.Module):
 @dataclass 
 class BeniConfig:
     vision_name_or_path: str = None
-    llm_name_or_path: str = None
+    text_name_or_path: str = None
+    vision_cls: str = 'AutoModel'
+    vision_processor_cls: str = 'AutoProcessor'
+    text_cls: str = 'AutoModelForCausalLM'
     r: int = 4
     freeze: bool = True # whether or not to freeze llm and vision
     attn_implementation: str = "sdpa" # should be able to switch this for flash attn i hope (same for clip?)
@@ -106,20 +117,7 @@ class Beni(nn.Module):
     def __init__(self, config: BeniConfig):
         super().__init__()
         self.config = config
-
-        # vision
-        v = CLIPVisionModel.from_pretrained(config.vision_name_or_path)
-        p = CLIPImageProcessor.from_pretrained(config.vision_name_or_path)
-        self.vision = VisionTower(v, p, config.r)
-
-
-        # text -- maybe turn into module like `vision`
-        self.llm = AutoModelForCausalLM.from_pretrained(config.llm_name_or_path, attn_implementation=config.attn_implementation,)
-        self.tok = AutoTokenizer.from_pretrained(config.llm_name_or_path)
-        self.tok.padding_side = 'right'
-        self.tok.add_tokens(["<img>", "</img>"])
-        
-        self.llm.resize_token_embeddings(len(self.tok)) #https://huggingface.co/docs/transformers/en/main_classes/model
+        self.build_vision_and_text(config)
 
         # connector
         self.connector = Connector(self.vision_config.hidden_size, self.text_config.hidden_size)
@@ -127,6 +125,25 @@ class Beni(nn.Module):
         # freeze 
         if self.config.freeze:
             self.freeze()
+
+    def build_vision_and_text(self, config):
+        vision_cls = getattr(transformers, config.vision_cls, 'AutoModel')
+        vision_processor_cls = getattr(transformers, config.vision_processor_cls, 'AutoProcessor')
+        text_cls = getattr(transformers, config.text_cls, 'AutoModelForCausalLM')
+
+        v = vision_cls.from_pretrained(config.vision_name_or_path)
+        p = vision_processor_cls.from_pretrained(config.vision_name_or_path)
+        self.vision = VisionTower(v, p, config.r)
+
+
+        # text -- maybe turn into module like `vision`
+        self.llm = text_cls.from_pretrained(config.text_name_or_path, attn_implementation=config.attn_implementation,)
+        self.tok = AutoTokenizer.from_pretrained(config.text_name_or_path)
+        self.tok.padding_side = 'right'
+        self.tok.add_tokens(["<img>", "</img>"])
+        
+        self.llm.resize_token_embeddings(len(self.tok)) #https://huggingface.co/docs/transformers/en/main_classes/model
+
 
     def freeze(self):
         for n,p in self.named_parameters():
@@ -136,7 +153,7 @@ class Beni(nn.Module):
 
     @property
     def text_config(self):
-        return AutoConfig.from_pretrained(self.config.llm_name_or_path)
+        return AutoConfig.from_pretrained(self.config.text_name_or_path)
     @property
     def vision_config(self):
         return self.vision.config
@@ -328,18 +345,21 @@ if __name__ == "__main__":
     import sys
     sys.path.insert(1, "../")
     from d import *
-
-    VISION_MODEL_ID = "openai/clip-vit-large-patch14"
-    TEXT_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    import io
+    import requests
 
     cfg = BeniConfig(
-        vision_name_or_path = VISION_MODEL_ID,
-        llm_name_or_path = TEXT_MODEL_ID,
-        r = 1,
+        vision_name_or_path = "google/siglip-so400m-patch14-384",
+        text_name_or_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        #text_name_or_path = "openai-community/gpt2",
+        vision_cls = "SiglipVisionModel",
+        vision_processor_cls = "SiglipImageProcessor",
+        r = 8,
         freeze = True,
+        attn_implementation="eager",
     )
-        
     beni = Beni(cfg)
+    beni.connector.load_state_dict(torch.load("../test.pt")) #from ckpt
     beni.to("cuda")
     beni.pretty_print()
     
@@ -349,22 +369,26 @@ if __name__ == "__main__":
         lr = 1e-03,
     )
 
-    ds = load_recap(beni.tok, 10)
-    dl = torch.utils.data.DataLoader(ds, batch_size = 1, collate_fn = functools.partial(sft_collate_fn, tok=beni.tok))
-    inputs = next(iter(dl))
+    #ds = load_recap(beni.tok, 10)
+    #dl = torch.utils.data.DataLoader(ds, batch_size = 1, collate_fn = functools.partial(sft_collate_fn, tok=beni.tok))
+    #inputs = next(iter(dl))
 
-    for k, v in inputs.items():
-        if isinstance(v, torch.Tensor):
-            inputs[k] = v.to(beni.device)
+    #for k, v in inputs.items():
+    #    if isinstance(v, torch.Tensor):
+    #        inputs[k] = v.to(beni.device)
 
-    inputs.pop('input_ids')
-    inputs.pop('url')
+    #inputs.pop('input_ids')
+    #inputs.pop('url')
     #inputs.pop('images')
     #print(inputs)
+
+    img = Image.open(io.BytesIO(requests.get("https://imgsrv.crunchyroll.com/cdn-cgi/image/fit=contain,format=auto,quality=85,width=480,height=720/catalog/crunchyroll/efb29ad752e647212b3e199da7748e9e.jpg").content)).convert("RGB")
+    inputs = {'images': [img,]}
 
     out = beni.generate(**inputs, max_new_tokens = 64)
     print(beni.tok.batch_decode(out))
 
+    #out = beni(**inputs)
     #loss = out['loss']
     #loss.backward()
 

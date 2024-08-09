@@ -74,7 +74,7 @@ class CustomDatasetForImages(CustomDataset):
             except:
                 return (idx, None)
 
-        with ThreadPoolExecutor(max_workers = int(os.environ.get("OMP_NUM_THREADS", 4))) as executor:
+        with ThreadPoolExecutor(max_workers = int(os.environ.get("OMP_NUM_THREADS", 8))) as executor:
             res = list(tqdm(executor.map(lambda args: download(*args), urls_enumed), total=len(urls_enumed)))
 
         # remove bad ids from data 
@@ -90,10 +90,35 @@ class CustomDatasetForImages(CustomDataset):
             pass
 
 
+# no build at init 
+class LazyCustomDatasetForImages(CustomDatasetForImages):
+    def __init__(self, data, request_timeout: float = 3):
+        CustomDataset.__init__(self, data)
+        self.timeout = request_timeout
+
+    def __getitem__(self, idx):
+        try:
+            img = self.get_image(self.data[idx]['url'])
+            if len(img.size)>2 or img.size[:2]==(1,1):
+                img = None
+        except:
+            img = None
+        return {**self.data[idx], 'images': img}
+
+
 def sft_collate_fn(inputs, tok):
     """
     dynamically pads input tensors and constructs attn mask
     """
+    # remove samples which we couldn't download image for
+    bad_ids = [i for i, sample in enumerate(inputs) if sample.get('images', True) is None]
+    bad_ids = bad_ids[::-1]
+    for i in bad_ids:
+        inputs.pop(i)
+
+    if len(inputs) == 0:
+        return None
+
     # LD -> DL
     inputs = {k: [i[k] for i in inputs] for k in inputs[0].keys()}
     input_ids = inputs["input_ids"]
@@ -163,6 +188,7 @@ def tiny_shakespeare(tok, slen = 512):
 def load_data_from_generator(data: datasets.Dataset, 
                              tok, 
                              n: int = 100, 
+                             ctx_len: int = 384,
                              preprocess: Callable[[datasets.Dataset,],datasets.Dataset]=None,
                              template = "{prompt}\n{response}</s>"):
     """
@@ -196,7 +222,7 @@ def load_data_from_generator(data: datasets.Dataset,
             prompt_len = [len(tok.encode("{p}\n".format(p=p))) for p in prompts] #TODO: make this better
         else:
             prompts = ['']*len(samples['response'])
-            prompt_len = [0 for _ in prompts] # 1 for the <
+            prompt_len = [0 for _ in prompts] # 1 for the 
 
         resp = samples['response']
         inputs = [template.format(prompt=p, response=r).strip() for p,r in zip(prompts,resp)]
@@ -213,7 +239,7 @@ def load_data_from_generator(data: datasets.Dataset,
     data = data.map(process, batched=True,)
 
     # filter
-    #data = data.filter(lambda x: [len(y) <= 512 for y in x["input_ids"]], batched=True)
+    data = data.filter(lambda x: [len(y) <= ctx_len for y in x["input_ids"]], batched=True)
 
     # loadable in torch dataloader
     return data
@@ -237,9 +263,10 @@ def load_recap(tok, n=100):
         samples = samples.filter(lambda x: x['re_clip_score']>0.85)
         return samples
 
-    data = load_data_from_generator(data, tok, n=n, preprocess=None)
+    data = load_data_from_generator(data, tok, n=n, ctx_len = (196-91-2), preprocess=None)
     data = data.to_list()
-    return CustomDatasetForImages(data)
+    return LazyCustomDatasetForImages(data)
+
 
 if __name__ == "__main__":
     from transformers import AutoTokenizer
