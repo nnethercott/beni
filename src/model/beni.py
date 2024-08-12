@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Callable, Optional, List, Tuple, Union
 from PIL import Image
 import functools
@@ -20,15 +20,12 @@ from transformers import(
     LlamaConfig,
     AutoTokenizer,
 )
+from peft import PeftModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
+from .vision import VisionTower
 
-"""
-NOTES: 
-    * ideally: Beni(text_config, vision_config)
-        * need some hf utils to find the right vision classes to load vision tower
-"""
 
 def rank_0_only(f):
     def wrap(*args, **kwargs):
@@ -37,52 +34,24 @@ def rank_0_only(f):
     return wrap
 
 
-class VisionTower(nn.Module):
-    """
-    todo:
-        - add feature select index
-        - trainable token pool ?
-        - do we want the [cls] token as well?
-    """
-    def __init__(self, vision: PreTrainedModel, processor: Callable[[Image],torch.Tensor], r: int = 1):
-        super().__init__()
-        self.vision = vision 
-        self.feature_select_index = -1
-        self.r = r 
+# transformer-like
+# make sure to wrap in fsdp
+#class Connector(nn.Module):
+#    def __init__(self, d_in, d_out):
+#        super().__init__()
+#
+#        self.norm_1 = nn.LayerNorm(d_in)
+#        self.proj_1 = nn.Sequential(
+#            nn.Linear(d_in, d_in),
+#            nn.GELU(),
+#        )
+#        self.norm_2 = nn.LayerNorm(d_in)
+#        self.proj_2 = nn.Linear(d_in, d_out)
+#
+#    def forward(self, x):
+#        x = x + self.proj_1(self.norm_1(x))
+#        return self.proj_2(self.norm_2(x))
 
-        if hasattr(processor, "image_processor"):
-            self.processor = processor.image_processor  # instantiated with AutoProcessor 
-        else:
-            self.processor = processor 
-
-        # update self.vision.config 
-        setattr(self.config, 'hidden_size', r*self.vision.config.hidden_size)
-        
-    @property
-    def device(self):
-        return self.vision.device
-
-    @property
-    def config(self):
-        # if model loaded with automodel 
-        if hasattr(self.vision.config, "vision_config"):
-            return self.vision.config.vision_config
-        else:
-            return self.vision.config
-
-
-    def forward(self, x):
-       x = self.processor(x, return_tensors = 'pt')['pixel_values']
-       
-       x = self.vision(x.to(self.device), output_hidden_states=True)
-       x = x['hidden_states'][self.feature_select_index][:,1:,:]
-       b,s,d = x.shape
-
-       # concatenate adjacent tokens a la minigpt4-v2
-       return x.reshape((b, s//self.r, -1))  
-
-
-# revisit later
 class Connector(nn.Module):
     def __init__(self, d_in, d_out):
         super().__init__()
@@ -107,6 +76,7 @@ class BeniConfig:
     r: int = 4
     freeze: bool = True # whether or not to freeze llm and vision
     attn_implementation: str = "sdpa" # should be able to switch this for flash attn i hope (same for clip?)
+    img_size: dict = None
 
 
 class Beni(nn.Module):
@@ -133,7 +103,7 @@ class Beni(nn.Module):
 
         v = vision_cls.from_pretrained(config.vision_name_or_path)
         p = vision_processor_cls.from_pretrained(config.vision_name_or_path)
-        self.vision = VisionTower(v, p, config.r)
+        self.vision = VisionTower(v, p, **asdict(config))
 
 
         # text -- maybe turn into module like `vision`
@@ -141,6 +111,7 @@ class Beni(nn.Module):
         self.tok = AutoTokenizer.from_pretrained(config.text_name_or_path)
         self.tok.padding_side = 'right'
         self.tok.add_tokens(["<img>", "</img>"])
+        #self.tok.add_tokens(["<s>", "</s>"])
         
         self.llm.resize_token_embeddings(len(self.tok)) #https://huggingface.co/docs/transformers/en/main_classes/model
 
@@ -168,24 +139,11 @@ class Beni(nn.Module):
     def device(self):
         return self.vision.device
 
-    def pretty_print(self):
-        params = sum(p.numel() for p in self.parameters())
-        trainable = sum(p.numel() if p.requires_grad else 0 for p in self.parameters())
-
-        if dist.is_initialized():
-            params = torch.tensor(params, device="cuda") # dist group is nccl
-            trainable = torch.tensor(trainable, device="cuda")
-
-            # reduce on rank 0 and print
-            dist.reduce(params, 0, op=dist.ReduceOp.SUM)
-            dist.reduce(trainable, 0, op=dist.ReduceOp.SUM)
-
-            if int(os.environ["LOCAL_RANK"]) == 0: #turn this into a `is_rank_0` function?
-                print(f'VLM with: {params.item()/1e9:.1f}B params | {100*trainable.item()/params.item():.2f}% trainable\n')
-                print(self)
-        else:
-            print(f'VLM with: {params/1e9:.1f}B params | {100*trainable/params:.2f}% trainable\nprint_trainable_parameters')
-            print(self)
+    @property
+    def embed_tokens(self):
+        if isinstance(self.llm, PeftModel):
+            return self.llm.model.model.embed_tokens
+        return self.llm.model.embed_tokens
 
 
     def prepare_inputs(
@@ -207,25 +165,27 @@ class Beni(nn.Module):
         """
 
         if images is None:
+            #print("text")
             return input_ids, attention_mask, inputs_embeds, labels
 
+        #print("images")
         bsz = len(images)
 
         vision_embeds = self.vision(images)
         vision_embeds = self.connector(vision_embeds)
-        
+
         # bos
         bos_token = torch.tensor(self.tok.bos_token_id, device=self.device).unsqueeze(0)
-        bos_embeds = self.llm.model.embed_tokens(bos_token).repeat((bsz,1,1))
+        bos_embeds = self.embed_tokens(bos_token).repeat((bsz,1,1))
         
         # embed <img> and </img>
         img_token = torch.tensor(self.img_token, device=self.device).unsqueeze(0)
-        img_embeds = self.llm.model.embed_tokens(img_token).repeat((bsz,1,1))
+        img_embeds = self.embed_tokens(img_token).repeat((bsz,1,1))
         end_img_token = torch.tensor(self.end_img_token, device=self.device).unsqueeze(0)
-        end_img_embeds = self.llm.model.embed_tokens(end_img_token).repeat((bsz,1,1))
+        end_img_embeds = self.embed_tokens(end_img_token).repeat((bsz,1,1))
 
         if input_ids is not None:
-            text_embeds = self.llm.model.embed_tokens(input_ids) 
+            text_embeds = self.embed_tokens(input_ids) 
 
             #<s><img>insert_image_featuers<img>prompt</s>
             inputs_embeds = torch.cat((bos_embeds, img_embeds, vision_embeds, end_img_embeds, text_embeds[:,1:,:]), dim=1)
@@ -278,6 +238,7 @@ class Beni(nn.Module):
         """
         assert input_ids is not None or images is not None, "You can't forward without text and/or images!"
 
+        #print(self.tok.batch_decode(input_ids))
         input_ids, attention_mask, inputs_embeds, labels = self.prepare_inputs(input_ids, attention_mask, inputs_embeds, labels, images)
             
         #print(kwargs)
@@ -328,6 +289,7 @@ class Beni(nn.Module):
             input_ids = None
 
         else:
+            # NOTE: we'll never generate with a peft model -- always merge first so this should hold
             inputs_embeds = self.llm.model.embed_tokens(input_ids)
 
         #print(inputs_embeds.shape)
@@ -344,24 +306,28 @@ if __name__ == "__main__":
     from datasets import load_dataset
     import sys
     sys.path.insert(1, "../")
-    from d import *
+    from data import *
     import io
     import requests
+    from peft import PeftModel, PeftConfig
 
     cfg = BeniConfig(
         vision_name_or_path = "google/siglip-so400m-patch14-384",
         text_name_or_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        #text_name_or_path = "openai-community/gpt2",
         vision_cls = "SiglipVisionModel",
         vision_processor_cls = "SiglipImageProcessor",
-        r = 8,
+        r = 11,
         freeze = True,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
+        img_size = {'height': 448, 'width': 448},
     )
     beni = Beni(cfg)
-    beni.connector.load_state_dict(torch.load("../test.pt")) #from ckpt
-    beni.to("cuda")
-    beni.pretty_print()
+    beni.connector.load_state_dict(torch.load("./model_checkpoints/finetune/tinyllama1b-siglip400m-ft-connector-step12000.pt")) 
+    beni.llm = PeftModel.from_pretrained(beni.llm, "./model_checkpoints/finetune/tinyllama1b-siglip400m-ft-step12000")
+    beni.llm = beni.llm.merge_and_unload()
+    #beni.to("cuda")
+    #beni.pretty_print()
+    print(beni)
     
 
     optimizer = torch.optim.AdamW(
@@ -382,10 +348,19 @@ if __name__ == "__main__":
     #inputs.pop('images')
     #print(inputs)
 
-    img = Image.open(io.BytesIO(requests.get("https://imgsrv.crunchyroll.com/cdn-cgi/image/fit=contain,format=auto,quality=85,width=480,height=720/catalog/crunchyroll/efb29ad752e647212b3e199da7748e9e.jpg").content)).convert("RGB")
-    inputs = {'images': [img,]}
+    inputs = {}
+    img = Image.open(io.BytesIO(requests.get("https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcS7PD6N_veaEeELjZn_7J4MNDBGEY1GC83VVQ&s").content)).convert("RGB")
+    #sentence = "tell me a funny story about a russian."
+    sentence = "describe this image please."
+    template = "{prompt}</s>\n"
+    inputs = beni.tok(template.format(prompt=sentence), return_tensors='pt')
+    inputs['images'] = [img,]
 
-    out = beni.generate(**inputs, max_new_tokens = 64)
+    for k, v in inputs.items():
+        if isinstance(v, torch.Tensor):
+            inputs[k] = v.to(beni.device)
+
+    out = beni.generate(**inputs, max_new_tokens = 128, do_sample=False, num_beams=3, num_return_sequences=1)
     print(beni.tok.batch_decode(out))
 
     #out = beni(**inputs)

@@ -4,3 +4,4 @@ venv
 **/*.pt
 **/*\\.pyc
 **/*.swp
+src/model_checkpoints

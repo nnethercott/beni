@@ -2,7 +2,7 @@ import random
 import functools
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Optional, List 
 
 import torch
@@ -30,10 +30,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, HfArgu
 
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.clip.modeling_clip import CLIPEncoderLayer
+from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
+from transformers.models.phi3.modeling_phi3 import Phi3DecoderLayer
+
 from peft import LoraConfig, get_peft_model
 
 # local 
-from d import *
+from data import *
 from policies.wrapping import fsdp_auto_wrap_policy, get_llama_wrapper
 from utils.train_utils import clear_gpu_cache, setup_environ_flags, get_cosine_schedule_with_warmup
 from configs import TrainConfig, WandbConfig, FSDPConfig
@@ -58,8 +61,19 @@ def fsdp_main(model_config, **kwargs):
     train_config = kwargs['train_config']
     wandb_config = kwargs['wandb_config']
     fsdp_config = kwargs['fsdp_config']
+    lora_config = kwargs.get("lora_config", None)
 
-    wandb_run = wandb_config.build_run()
+    # TODO: run a pip freeze on the venv and upload that too
+    """
+    try: 
+        from pip._internal.operations import freeze
+    except ImportError: # pip < 10.0
+        from pip.operations import freeze
+
+    pkgs = freeze.freeze() # add this to config dict
+    """
+    configs = {'model_config': model_config, 'train_config': train_config, 'fsdp_config': fsdp_config, 'lora_config': lora_config}
+    wandb_run = wandb_config.build_run(configs)
     
     rank = int(os.getenv("LOCAL_RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
@@ -82,9 +96,18 @@ def fsdp_main(model_config, **kwargs):
                 model = Beni(model_config)    
                 
         # LORA
-        #peft_config = LoraConfig(r=8, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none')
-        #model = get_peft_model(model, peft_config)
-        #model.print_trainable_parameters()
+        # TODO: make beniconfig subclass hf config so we can use model.save_pretrained
+        if train_config.enable_peft:
+            assert lora_config is not None 
+            model.llm = get_peft_model(model.llm, lora_config)
+
+
+        if rank == 0:
+            # print stuff
+            params = sum((p.numel() for p in model.parameters()))
+            trainable = sum((p.numel() for p in model.parameters() if p.requires_grad)) 
+            print(f'VLM with: {params/1e9:.1f}B params | {100*trainable/params:.2f}% trainable\n')
+
         
         my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, fsdp_config.transformer_cls)
         #my_auto_wrapping_policy = llama_autowrap_policy()
@@ -104,7 +127,7 @@ def fsdp_main(model_config, **kwargs):
         if fsdp_config.fsdp_activation_checkpointing:
             policies.apply_fsdp_checkpointing(model)
 
-        dist.barrier()
+        #dist.barrier()
 
     else:
         model = Beni(model_config)
@@ -113,17 +136,33 @@ def fsdp_main(model_config, **kwargs):
             model.load_state_dict(torch.load(train_config.ckpt_path))
         model.to(device)
 
-    model.pretty_print()
-        
-    # data -- hardcoded here
-    ds = load_recap(model.tok, 10000)
-    #ds = tiny_shakespeare(model.tok, slen = 512)
-    dl = DataLoader(ds, 
-                    batch_size = train_config.batch_size, 
-                    collate_fn = functools.partial(sft_collate_fn, tok=model.tok),
-                    shuffle=True,
-                    num_workers = 1,
-                    pin_memory=True)
+    #model.pretty_print()
+    if rank == 0:
+        print(model)
+    
+    # data -- # TODO: move later
+    dst = load_allava_text(model.tok, n=500000)
+    dsv = load_allava_laion(model.tok, n=500000)
+    dsr = load_recap(model.tok, n = 500000)
+
+    # shuffle per rank before multiloader creation 
+    #witness something crazy:
+    def sort_batch_shuffle(data, winsize):
+        data = sorted(data, key = lambda x: len(x['input_ids']))
+        data = [data[winsize*i: winsize*(i+1)] for i in range(len(data)//winsize + 1)]
+        random.shuffle(data)
+        data = [x for xs in data for x in xs] #thanks stack
+        return data
+
+    dst.data = sort_batch_shuffle(dst.data, train_config.batch_size)
+    dsv.data = sort_batch_shuffle(dsv.data, train_config.batch_size)
+    dsr.data = sort_batch_shuffle(dsr.data, train_config.batch_size)
+
+    dlt = DataLoader(dst, batch_size = train_config.batch_size, collate_fn = functools.partial(sft_collate_fn, tok=model.tok), num_workers=1, pin_memory=True, shuffle=False)
+    dlv = DataLoader(dsv, batch_size = train_config.batch_size, collate_fn = functools.partial(sft_collate_fn, tok=model.tok), num_workers=1, pin_memory=True, shuffle=False)
+    dsr = DataLoader(dsr, batch_size = train_config.batch_size, collate_fn = functools.partial(sft_collate_fn, tok=model.tok), num_workers=1, pin_memory=True, shuffle=False)
+
+    dl = MultiDataLoader(dlt, dlv, dsr, seed = 42) #each rank should see same modality
 
     # optimizer
     optimizer = torch.optim.AdamW(
@@ -149,12 +188,14 @@ def prepare_batch(batch):
 
 
 def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
+    print("training")
     c = train_config
     model.train()
 
     # recover rank 
     rank = int(os.getenv("LOCAL_RANK", 0))
 
+    total_len = len(dl)
     start_time = time.time()
     for i in range(c.n_epochs):
         for e, batch in enumerate(dl):
@@ -185,10 +226,35 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
                 dt = time.time()-tik 
 
                 if os.environ["LOCAL_RANK"] == '0':
-                    print(f"iter: {e+1}/{len(dl)}  loss: {loss.item():.2f}  lr: {scheduler.get_last_lr()[0]:.6f} [{(time.time()-start_time)/60:.2f} < {(dt*len(dl)/60):.2f}, {dt:.2f}s/it]")
+                    print(f"iter: {e+1}/{total_len}  loss: {loss.item():.2f}  lr: {scheduler.get_last_lr()[0]:.6f} [{(time.time()-start_time)/60:.2f} < {(dt*total_len/60):.2f}, {dt:.2f}s/it]")
 
-            if wandb_config is not None:
+            if wandb_run is not None:
                 data = {'loss': loss.item(), 'ppl': 2**(loss.item()), 'lr': scheduler.get_last_lr()[0]}
+                # all print :(
+                wandb_run.log(data)
+
+            # move later
+            if (e+1)%c.save_steps == 0:
+                if c.save_path is not None:
+                    # llm 
+                    if c.enable_peft:
+                        print(f"we are about to save the PEFT modules to {c.save_path}")
+                        model.llm.save_pretrained(f"{c.save_path}-step{e+1}")
+
+                    # connector
+                    if rank == 0:
+                        print(f"saving model to {c.save_path}...")
+                    if c.fsdp:
+                        with FSDP.state_dict_type(
+                                model, 
+                                fsdp_config.checkpoint_type,
+                                FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+                            ):
+                                cpu_state = model.connector.state_dict()
+                                if rank == 0:
+                                    torch.save(cpu_state, f"{c.save_path}-connector-step{e+1}.pt")
+                    else:
+                        torch.save(model.connector.state_dict(), f"{c.save_path}-connector-step{e+1}.pt")
                         
 
     # training done
@@ -197,6 +263,12 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
     # save on epoch end 
     # TODO: add saving at save_steps
     if c.save_path is not None:
+        # llm 
+        if c.enable_peft:
+            print(f"we are about to save the PEFT modules to {c.save_path}")
+            model.llm.save_pretrained(f"{c.save_path}-step{e+1}")
+
+        # connector
         if rank == 0:
             print(f"saving model to {c.save_path}...")
         if c.fsdp:
@@ -207,52 +279,58 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
                 ):
                     cpu_state = model.connector.state_dict()
                     if rank == 0:
-                        torch.save(cpu_state, c.save_path)
+                        torch.save(cpu_state, f"{c.save_path}-connector-step{e+1}.pt")
         else:
-            torch.save(model.connector.state_dict(), c.save_path)
+            torch.save(model.connector.state_dict(), f"{c.save_path}-connector-step{e+1}.pt")
+                        
 
 
 
 if __name__ == "__main__":
     setup()
 
-    VISION_MODEL_ID = "openai/clip-vit-large-patch14"
-    TEXT_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    #TEXT_MODEL_ID = "TinyLlama/TinyLlama_v1.1"
-
     model_config = BeniConfig(
         vision_name_or_path = "google/siglip-so400m-patch14-384",
+        #vision_name_or_path = "openai/clip-vit-large-patch14",
         text_name_or_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        #text_name_or_path = "HuggingFaceTB/SmolLM-360M",
+        #text_name_or_path = "microsoft/Phi-3-mini-4k-instruct",
         vision_cls = "SiglipVisionModel",
         vision_processor_cls = "SiglipImageProcessor",
-        r = 8,
         freeze = True,
         attn_implementation = "sdpa",
+        img_size = {'height': 448, 'width': 448},
+        r = 11,
     )
 
     train_config = TrainConfig(
         warmup_ratio = 0.03,
         batch_size = 8,
         gradient_accumulation_steps = 1,
-        lr = 1e-04,
+        lr = 3e-05,
+        weight_decay = 0.1,
+        min_lr = 1e-05,
         grad_clip = 1.0,
-        save_steps = 100,
+        save_steps = 1200,
         log_steps = 1,
-        save_path = 'test.pt',
-        ckpt_path = None,
-        betas = [0.9, 0.999],
+        save_path = './model_checkpoints/finetune/tinyllama1b-siglip400m-ft',
+        ckpt_path = './model_checkpoints/tinyllama1b-2-siglip400m.pt',
+        betas = [0.9, 0.95],
         fsdp=True,
+        enable_peft=True,
     )
     fsdp_config = FSDPConfig(
-        transformer_cls=(LlamaDecoderLayer, CLIPEncoderLayer),
+            #transformer_cls=(LlamaDecoderLayer, CLIPEncoderLayer),
+            transformer_cls=(LlamaDecoderLayer, SiglipEncoderLayer), # need this for weight tying: torch.nn.Embedding, # if we upscale images we can't fsdp the positional embeddings ?
     )
     wandb_config = WandbConfig(
-        enable = False,
+        enable = True,
         project = "vlm",
         entity = "nnethercott",
     )
+    lora_config = LoraConfig(r=8, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none')
 
-    kwargs = {'train_config': train_config, 'fsdp_config': fsdp_config, 'wandb_config': wandb_config}
+    kwargs = {'train_config': train_config, 'fsdp_config': fsdp_config, 'wandb_config': wandb_config, 'lora_config': lora_config}
 
     # launch train
     fsdp_main(model_config, **kwargs)

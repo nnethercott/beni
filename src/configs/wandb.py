@@ -16,9 +16,10 @@ class WandbConfig:
     notes: Optional[str] = None
     mode: Optional[str] = None
 
-    def build_run(self):
+    def build_run(self, configs={}):
         self_dict = asdict(self)
+
         if self_dict.pop('enable'):
-            return wandb.init(**self_dict)
+            return wandb.init(**self_dict, config = configs)
         else:
             return None

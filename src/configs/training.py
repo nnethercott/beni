@@ -19,7 +19,8 @@ class TrainConfig:
     betas: List = field(default_factory = lambda: [0.9, 0.999]),
     ckpt_path: Optional[str] = None
     save_path: Optional[str] = None
-    fsdp: Optional[bool] = True
+    fsdp: bool = True
+    enable_peft: bool = False
 
 
 @dataclass

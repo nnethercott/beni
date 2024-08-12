@@ -106,6 +106,63 @@ class LazyCustomDatasetForImages(CustomDatasetForImages):
         return {**self.data[idx], 'images': img}
 
 
+# can use this for diverse batch sizes in normal dataset ordered by context length too
+# can nest these as well
+class MultiDataLoader:
+    """
+    random sample between several dataloaders, allowing for multimodality training
+    """
+    def __init__(self, *loaders, **kwargs):
+        self.loaders = list(loaders)
+        self.loader_iters = [iter(loader) for loader in self.loaders]  
+        self.loader_lens = [len(loader) for loader in self.loaders]  
+        self.buffer = list(range(len(self.loaders)))  
+        self.weights =  [l/sum(self.loader_lens) for l in self.loader_lens]
+
+        # hacky 
+        seed = kwargs.get('seed', None)
+        if seed:
+            self.sampler = random.Random(seed)
+        else:
+            self.sampler = None
+
+    def __len__(self):
+        return sum(self.loader_lens)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.buffer:  # If the buffer is empty, all loaders are exhausted
+            raise StopIteration
+
+        if self.sampler is not None:
+            idx = self.sampler.choices(self.buffer, weights = self.weights, k=1)[0]
+        else:
+            idx = random.choices(self.buffer, weights=self.weights, k=1)[0]
+
+        try:
+            batch = next(self.loader_iters[idx])
+            self.loader_lens[idx] -= 1  
+
+            if self.loader_lens[idx] == 0:
+                # remove data loader
+                self.buffer.pop(idx)
+                self.loader_iters.pop(idx)
+                self.loader_lens.pop(idx)
+                self.weights.pop(idx)
+
+                # fix buffer indices 
+                self.buffer = list(range(len(self.loader_iters)))  
+
+            return batch
+
+        except StopIteration:
+            # should be gone already, but if there remove it and attempt to fetch from another loader
+            self.buffer.remove(idx)
+            return self.__next__()
+
+
 def sft_collate_fn(inputs, tok):
     """
     dynamically pads input tensors and constructs attn mask
@@ -150,7 +207,7 @@ def sft_collate_fn(inputs, tok):
     labels_t.masked_fill_(attn_mask == 0, -100)
 
     if prompt_len != [0]*len(prompt_len):
-        labels_t.masked_fill_(pos<=prompt_end, -100) #-1 comes from \n between prompt and answer 
+        labels_t.masked_fill_(pos<prompt_end, -100) 
 
     return {
         "input_ids": input_ids_t,
@@ -161,36 +218,15 @@ def sft_collate_fn(inputs, tok):
     }
 
 
-# a test dataset for llms
-def tiny_shakespeare(tok, slen = 512):
-    data = datasets.load_dataset(
-        "karpathy/tiny_shakespeare",
-        split="train",
-        trust_remote_code=True,
-    )
-    # one big string
-    text = data['text'][0]
-    tokens = tok.encode(text, add_special_tokens=False)
-    tokens = torch.tensor(tokens[:(slen-2)*(len(tokens)//(slen-2))]).reshape((-1, slen-2))
-    bos = tok.bos_token_id*torch.ones(len(tokens)).unsqueeze(1).to(torch.long)
-    eos = tok.eos_token_id*torch.ones(len(tokens)).unsqueeze(1).to(torch.long)
-
-    #concat 
-    tokens = torch.cat((bos, tokens, eos), dim=1)
-    tokens = tokens.tolist()[:128]
-    
-    data = [{"prompt_len": 0, "input_ids": t} for t in tokens]
-    ds = CustomDataset(data)
-
-    return ds
-    
-
+# TODO: move to format with conversation entries ?
 def load_data_from_generator(data: datasets.Dataset, 
                              tok, 
                              n: int = 100, 
+                             skip: int = 0,
                              ctx_len: int = 384,
+                             truncate: bool = False,
                              preprocess: Callable[[datasets.Dataset,],datasets.Dataset]=None,
-                             template = "{prompt}\n{response}</s>"):
+                             ):
     """
     Arguments:
         - data: lazy dataset loaded with `streaming=True`. dataset should have column 'response'. if no 'prompt' present we use ''
@@ -198,38 +234,42 @@ def load_data_from_generator(data: datasets.Dataset,
         - template: optional syntaxing 
         - n: how many samples to load
         - preprocess: optional preprocessing mapped before the boilerplate
+        - ctx_len: max length for input ids
+        - trim: if true we truncate samples exceeding max length, else we filter them out
     
     features:
         - adds EOS token to the end of each text entry -> formats like SOS+encoded+EOS
             - ensures free lunch with pure-text datasets, image ones handled by vlm 
     """
 
+    template = "{prompt}{response}"+tok.eos_token
 
     # load
-    data = data.take(n)
+    data = data.skip(skip).take(n)
     def dataset_generator(dataset):
         yield from dataset
     data = datasets.Dataset.from_generator(functools.partial(dataset_generator, data))
-    #return data
 
-    # pre-boilerplate processing
+    # pre-processing
     if preprocess is not None:
         data = preprocess(data)
 
     def process(samples):
         if 'prompt' in samples.keys():
-            prompts = samples['prompt']
-            prompt_len = [len(tok.encode("{p}\n".format(p=p))) for p in prompts] #TODO: make this better
+            prompts = [p + tok.eos_token + '\n' for p in samples['prompt']] #<s><img></img>prompt</s>\nanswer</s>
+            prompt_len = [len(tok.encode(p)) for p in prompts] # add \n 
         else:
             prompts = ['']*len(samples['response'])
             prompt_len = [0 for _ in prompts] # 1 for the 
 
         resp = samples['response']
         inputs = [template.format(prompt=p, response=r).strip() for p,r in zip(prompts,resp)]
-        input_ids = [tok.encode(i) for i in inputs]
 
-        # NOTE: this doesn't consider the additional tokens coming from the template - e.g. "USER: {prompt}\nASSISTANT: {response}"
-        
+        if truncate:
+            input_ids = [tok.encode(i)[:ctx_len] for i in inputs]
+        else:
+            input_ids = [tok.encode(i) for i in inputs]
+
         samples['input_ids'] = input_ids
         samples['prompt_len'] = prompt_len
 
@@ -239,41 +279,11 @@ def load_data_from_generator(data: datasets.Dataset,
     data = data.map(process, batched=True,)
 
     # filter
-    data = data.filter(lambda x: [len(y) <= ctx_len for y in x["input_ids"]], batched=True)
+    if not truncate:
+        data = data.filter(lambda x: [len(y) <= ctx_len for y in x["input_ids"]], batched=True)
 
     # loadable in torch dataloader
     return data
 
 
-def load_recap(tok, n=100):
-    """
-    some samples won't download so we'll have to delete those
-    """
-    data = datasets.load_dataset(
-        "UCSC-VLAA/Recap-DataComp-1B",
-        split="train",
-        streaming=True,
-        token=os.environ["HF_ACCESS_TOKEN"],
-    )
 
-    data = data.rename_columns({'re_caption': 'response'})
-    
-    # some pretty trash images - but their values are broken
-    def preprocess(samples):
-        samples = samples.filter(lambda x: x['re_clip_score']>0.85)
-        return samples
-
-    data = load_data_from_generator(data, tok, n=n, ctx_len = (196-91-2), preprocess=None)
-    data = data.to_list()
-    return LazyCustomDatasetForImages(data)
-
-
-if __name__ == "__main__":
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    ds = load_recap(tok, 100)
-    #dl = DataLoader(ds, batch_size = 4, collate_fn = functools.partial(sft_collate_fn, tok=tok))
-    #batch = next(iter(dl))
-    #print(batch)
-    
