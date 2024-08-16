@@ -28,12 +28,37 @@
 * [ ] alt quantization schemes (e.g. HQQ) 
 * [ ] DLoRA 
 * [ ] play around with sequence packing in train
-* [ ] perceiver resampler to replace minigpt token concat?
+* [ ] perceiver resampler 
+    * either use the idefics2 one or we use our own implementation (test both) 
 * [ ] interpolate positional embeddings for high res images in vision encoder
     * adding high res on clip will require us making our own clip fork
     * add better check that `interpolate_pos_encoding` in vision.forward fn signature
 * [ ] `enable_inputs_require_grads` for lora training & fsdp 
 * [ ] make `BeniConfig` subclass hf config so we can peft beni and `.save_pretrained`
+* [ ] add a demo subdir with docker compose for spinning up model worker, flask server, and gradio app 
+    * [this commit](https://github.com/Deepomatic/vlm_dev/commit/ffc2e11e57aaac8ec63679978cbedef44bba3e41)
+
+
+## ideas
+Test these with same random seed over same datasets for fixed training steps
+* img feature selection
+    * dragonfly-like topk based on cosine similarity with embedding of user prompt 
+        * initially we use 2 resolutions and know a-priori how many total patches we want (this or we start padding image token sequences -> bad for runtime since we already made the assumption when optimizing with dynamic collate; chill tho if perceiver resamplaer)
+        * when no text present we'd need some trainable vector as the null, or uniform patching 
+        * either toss direct into model or into resampler
+    * region proposal network & crops
+    * perceiver resampler lets us compress an arbitrary sequence into a fixed length 
+        * can use arbitrary length concatenated sequences of different crop features, or threshold-based dragonfly 
+        * grouped query attention perceiver resampler ??
+        
+* [gated attention](https://arxiv.org/pdf/1912.00349) might be cool as an alternative to cosing of prompt and image patch. 
+    * could draw patches ~ p where p=sigmoid(cosine(prompt, patch))
+    * might be more or less sparse than threshold based patch selection, still don't know
+    * math idea: $p(z) \sim \text{Beta}(\alpha, \beta)$ w/ $\beta > \alpha$ so that $\mathbb{E}[z] = \frac{\alpha}{\alpha+\beta} <0.5$. Then we have $z = \phi(x)$ so that $p(z|x)\sim \text{Beta}(\alpha+k, \beta+n-k)$ (n=bsz) ??
+        * first lets sample using the gumbel softmax trick and observe the sparsity. after that we can try to impose a prior on how many patches should be active using the beta prior/bernoulli formulation 
+        * [blog post](https://www.johndcook.com/blog/2009/11/24/kumaraswamy-distribution/) and [cross validated post](https://stats.stackexchange.com/questions/51820/fast-approximation-to-inverse-beta-cdf) on psuedo-beta sampling
+        * the auxiliary network would map the image patch to $[\alpha, \beta] \in \mathbb{R}^{2}$
+        * i think we'd have to do a pretraining to determine the weights of the gating network and then when we finetune for real we can igore any token which is "turned off" by dropping it from the sequence. otherwise we can't jointly train the network on dynamically-determined variable-length sequences 
 
 
 ## Notes
@@ -42,3 +67,5 @@
 * when training distributed, if processes see a batch of different modalities then our connector may not be active => gradients=None => all_reduce step blocking since one rank attemps to aggregate gradients which don't exist in other processes ?
     * could probably avoid this (statistically) with grad accumulation and hope each rank sees both images & text
     * **or** make sure modality per iter is the same for each rank
+* on multimodal training data we should grad accumulate so that gradients contain info pertaining to all modalities before stepping (i think)
+    * adamw maintains state so we have this mix-of-modalities step implicitly, but its best to be more clear

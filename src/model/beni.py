@@ -1,5 +1,5 @@
-from dataclasses import dataclass, asdict
-from typing import Callable, Optional, List, Tuple, Union
+from dataclasses import dataclass, asdict, field
+from typing import Callable, Optional, List, Tuple, Union, Any
 from PIL import Image
 import functools
 import os
@@ -13,10 +13,11 @@ import torch.distributed as dist
 import transformers
 from transformers import(
     AutoModel,
+    AutoConfig,
+    PretrainedConfig,
     AutoProcessor,
     PreTrainedModel, 
     AutoModelForCausalLM,
-    AutoConfig,
     LlamaConfig,
     AutoTokenizer,
 )
@@ -65,18 +66,74 @@ class Connector(nn.Module):
     def forward(self, x):
         return self.proj(self.norm(x))
 
+#@dataclass
+#class BeniConfig(PretrainedConfig):
+#    model_type = "beni"
+#    is_composition = True 
+#
+#    def __init__(
+#            self, 
+#            perceiver_config: PretrainedConfig = None,
+#            vision_name_or_path: str = None,
+#            text_name_or_path: str = None,
+#            vision_cls: str = None,
+#            text_cls: str = 'AutoModelForCausalLM',
+#            vision_processor_cls: str = None,
+#            r: int = 4,
+#            freeze: bool = True,
+#            attn_implementation: str = "eager",
+#            img_size: Optional[Union[dict, int]]=None,
+#            **kwargs,
+#    ):
+#        super().__init__(**kwargs)
+#        
+#        self.perceiver_config = perceiver_config
+#        self.vision_name_or_path=vision_name_or_path 
+#        self.text_name_or_path=text_name_or_path
+#        self.vision_cls=vision_cls
+#        self.vision_processor_cls=vision_processor_cls
+#        self.text_cls=text_cls
+#        self.r=r
+#        self.freeze=freeze
+#        self.attn_implementation=attn_implementation
+#        self.img_size=img_size
+#
+#        self._post_init()
+#
+#    def _post_init(self):
+#        self.text_config = AutoConfig.from_pretrained(self.text_name_or_path)
+#        self.vision_config = AutoConfig.from_pretrained(self.vision_name_or_path)
+#
+#        if hasattr(self.vision_config, 'vision_config'):
+#            self.vision_config = self.vision_config.vision_config
 
-@dataclass 
+
+@dataclass
 class BeniConfig:
+    perceiver_config: Optional[Union[Any, PretrainedConfig]] = None
     vision_name_or_path: str = None
     text_name_or_path: str = None
-    vision_cls: str = 'AutoModel'
-    vision_processor_cls: str = 'AutoProcessor'
+    vision_cls: str = None
     text_cls: str = 'AutoModelForCausalLM'
+    vision_processor_cls: str = None
     r: int = 4
-    freeze: bool = True # whether or not to freeze llm and vision
-    attn_implementation: str = "sdpa" # should be able to switch this for flash attn i hope (same for clip?)
-    img_size: dict = None
+    freeze: bool = True
+    attn_implementation: str = "eager"
+    img_size: Optional[Union[dict, int]]=None
+    text_config=None
+    vision_config=None
+
+    # Attributes to be set in post_init
+    text_config: Any = field(init=False)
+    vision_config: Any = field(init=False)
+
+    def __post_init__(self):
+        self.text_config = AutoConfig.from_pretrained(self.text_name_or_path)
+        self.vision_config = AutoConfig.from_pretrained(self.vision_name_or_path)
+
+        if hasattr(self.vision_config, 'vision_config'):
+            self.vision_config = self.vision_config.vision_config
+
 
 
 class Beni(nn.Module):
@@ -89,10 +146,8 @@ class Beni(nn.Module):
         self.config = config
         self.build_vision_and_text(config)
 
-        # connector
         self.connector = Connector(self.vision_config.hidden_size, self.text_config.hidden_size)
 
-        # freeze 
         if self.config.freeze:
             self.freeze()
 
@@ -101,39 +156,47 @@ class Beni(nn.Module):
         vision_processor_cls = getattr(transformers, config.vision_processor_cls, 'AutoProcessor')
         text_cls = getattr(transformers, config.text_cls, 'AutoModelForCausalLM')
 
+        # vision
         v = vision_cls.from_pretrained(config.vision_name_or_path)
         p = vision_processor_cls.from_pretrained(config.vision_name_or_path)
-        self.vision = VisionTower(v, p, **asdict(config))
+        self.vision = VisionTower(v, p, config)
 
-
-        # text -- maybe turn into module like `vision`
+        # text
         self.llm = text_cls.from_pretrained(config.text_name_or_path, attn_implementation=config.attn_implementation,)
-        self.tok = AutoTokenizer.from_pretrained(config.text_name_or_path)
-        self.tok.padding_side = 'right'
-        self.tok.add_tokens(["<img>", "</img>"])
-        #self.tok.add_tokens(["<s>", "</s>"])
+        self.tokenizer = AutoTokenizer.from_pretrained(config.text_name_or_path)
+        self.tokenizer.padding_side = 'right'
+        self.tokenizer.add_tokens(["<img>", "</img>"])
         
-        self.llm.resize_token_embeddings(len(self.tok)) #https://huggingface.co/docs/transformers/en/main_classes/model
+        # resize embeddings and lm_head https://huggingface.co/docs/transformers/en/main_classes/model
+        self.llm.resize_token_embeddings(len(self.tokenizer)) 
 
 
     def freeze(self):
-        for n,p in self.named_parameters():
-            if 'connector' not in n:
-                p.requires_grad = False
+        for p in self.parameters():
+            p.requires_grad = False
+
+        for p in self.connector.parameters():
+            p.requires_grad = True
+
+        if self.config.perceiver_config is not None:
+            for p in self.vision.resampler.parameters():
+                p.requires_grad = True
 
 
     @property
     def text_config(self):
         return AutoConfig.from_pretrained(self.config.text_name_or_path)
+
     @property
     def vision_config(self):
-        return self.vision.config
+        return self.vision.vision.config
+
     @property
     def img_token(self):
-        return self.tok.encode("<img>", add_special_tokens=False)[0]
+        return self.tokenizer.encode("<img>", add_special_tokens=False)[0]
     @property
     def end_img_token(self):
-        return self.tok.encode("<\img>", add_special_tokens=False)[0]
+        return self.tokenizer.encode("<\img>", add_special_tokens=False)[0]
 
     @property
     def device(self):
@@ -144,6 +207,11 @@ class Beni(nn.Module):
         if isinstance(self.llm, PeftModel):
             return self.llm.model.model.embed_tokens
         return self.llm.model.embed_tokens
+
+    @property
+    def n_img_prompt_tokens(self):
+        # TODO: compute this here 
+        return 93
 
 
     def prepare_inputs(
@@ -165,17 +233,15 @@ class Beni(nn.Module):
         """
 
         if images is None:
-            #print("text")
             return input_ids, attention_mask, inputs_embeds, labels
 
-        #print("images")
         bsz = len(images)
 
         vision_embeds = self.vision(images)
         vision_embeds = self.connector(vision_embeds)
 
         # bos
-        bos_token = torch.tensor(self.tok.bos_token_id, device=self.device).unsqueeze(0)
+        bos_token = torch.tensor(self.tokenizer.bos_token_id, device=self.device).unsqueeze(0)
         bos_embeds = self.embed_tokens(bos_token).repeat((bsz,1,1))
         
         # embed <img> and </img>
@@ -205,7 +271,7 @@ class Beni(nn.Module):
                 labels_prefix = torch.tensor([-100]*(vis_len+additional_len), device = self.device)
 
                 # IMPORTANT 
-                # NOTE: this assumes all samples in batch have same number of image tokens -- in future generalize
+                # NOTE: this assumes all samples in batch have same number of image tokens
                 labels_prefix = labels_prefix.repeat((bsz, 1)) 
                 labels = torch.cat((labels_prefix, labels), dim=1)
 
@@ -238,12 +304,12 @@ class Beni(nn.Module):
         """
         assert input_ids is not None or images is not None, "You can't forward without text and/or images!"
 
-        #print(self.tok.batch_decode(input_ids))
+        #print(self.tokenizer.batch_decode(input_ids))
         input_ids, attention_mask, inputs_embeds, labels = self.prepare_inputs(input_ids, attention_mask, inputs_embeds, labels, images)
             
         #print(kwargs)
         #print(attention_mask)
-        #print(self.tok.batch_decode(labels.masked_fill(labels==-100, self.tok.encode('X', add_special_tokens=False)[0])))
+        #print(self.tokenizer.batch_decode(labels.masked_fill(labels==-100, self.tokenizer.encode('X', add_special_tokens=False)[0])))
 
         return self.llm(
             input_ids=input_ids,
@@ -310,67 +376,55 @@ if __name__ == "__main__":
     import io
     import requests
     from peft import PeftModel, PeftConfig
+    from .vision import *
 
-    cfg = BeniConfig(
+    perceiver_config = PerceiverResamplerConfig(
+        hidden_size = 1152, # from siglip.config
+        depth = 1, 
+        n_latents = 64,
+        n_query_groups=1,
+        n_heads = 32,
+        head_dim = 64,
+        concat_latents_kv = False,
+        attention_dropout = 0.1,
+    )
+    #perceiver_config = None
+    model_config = BeniConfig(
+        perceiver_config = perceiver_config,
         vision_name_or_path = "google/siglip-so400m-patch14-384",
         text_name_or_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         vision_cls = "SiglipVisionModel",
         vision_processor_cls = "SiglipImageProcessor",
-        r = 11,
         freeze = True,
-        attn_implementation="sdpa",
-        img_size = {'height': 448, 'width': 448},
+        attn_implementation = "eager",
+        img_size = 384,
+        r = 1, #don't use this with perceiver 
     )
-    beni = Beni(cfg)
-    beni.connector.load_state_dict(torch.load("./model_checkpoints/finetune/tinyllama1b-siglip400m-ft-connector-step12000.pt")) 
-    beni.llm = PeftModel.from_pretrained(beni.llm, "./model_checkpoints/finetune/tinyllama1b-siglip400m-ft-step12000")
-    beni.llm = beni.llm.merge_and_unload()
-    #beni.to("cuda")
-    #beni.pretty_print()
+    beni = Beni(model_config)
     print(beni)
-    
 
-    optimizer = torch.optim.AdamW(
-        beni.parameters(),
-        lr = 1e-03,
-    )
+    step = 10400
+    beni.connector.load_state_dict(torch.load(f"./model_checkpoints/perceiver_test/test-connector-step{step}.pt")) 
+    beni.vision.resampler.load_state_dict(torch.load(f"./model_checkpoints/perceiver_test/test-resampler-step{step}.pt"))
 
-    #ds = load_recap(beni.tok, 10)
-    #dl = torch.utils.data.DataLoader(ds, batch_size = 1, collate_fn = functools.partial(sft_collate_fn, tok=beni.tok))
-    #inputs = next(iter(dl))
+    #beni.llm = PeftModel.from_pretrained(beni.llm, f"./model_checkpoints/tinyllama1b-siglip400m-ft-step{step}")
+    #beni.llm = beni.llm.merge_and_unload()
+    beni.to("cuda")
+    print(beni)
 
-    #for k, v in inputs.items():
-    #    if isinstance(v, torch.Tensor):
-    #        inputs[k] = v.to(beni.device)
-
-    #inputs.pop('input_ids')
-    #inputs.pop('url')
-    #inputs.pop('images')
-    #print(inputs)
 
     inputs = {}
-    img = Image.open(io.BytesIO(requests.get("https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcS7PD6N_veaEeELjZn_7J4MNDBGEY1GC83VVQ&s").content)).convert("RGB")
-    #sentence = "tell me a funny story about a russian."
-    sentence = "describe this image please."
-    template = "{prompt}</s>\n"
-    inputs = beni.tok(template.format(prompt=sentence), return_tensors='pt')
+    img = Image.open(io.BytesIO(requests.get("https://t4.ftcdn.net/jpg/06/09/71/31/360_F_609713150_riuPh8tilEhIjkZ6OrgJOhvedDwN1Cer.jpg").content)).convert("RGB")
+    #sentence = "what is this?"
+    #template = "{prompt}</s>\n"
+    #inputs = beni.tokenizer(template.format(prompt=sentence), return_tensors='pt')
     inputs['images'] = [img,]
 
     for k, v in inputs.items():
         if isinstance(v, torch.Tensor):
             inputs[k] = v.to(beni.device)
 
-    out = beni.generate(**inputs, max_new_tokens = 128, do_sample=False, num_beams=3, num_return_sequences=1)
-    print(beni.tok.batch_decode(out))
-
-    #out = beni(**inputs)
-    #loss = out['loss']
-    #loss.backward()
-
-    #for p in beni.connector.parameters():
-    #    print(p.grad)
-    #
-    #optimizer.step()
-    #optimizer.zero_grad()
+    out = beni.generate(**inputs, max_new_tokens = 256, do_sample=False, num_beams=3, num_return_sequences=1)
+    print(beni.tokenizer.batch_decode(out))
 
 
