@@ -21,10 +21,11 @@ import base64
 import torch 
 from flask import Flask, request, jsonify
 import gc
-
+import os 
 
 sys.path.insert(1, "../src/")
 from model import Beni, BeniConfig
+from checkpointing import load_model
 
 
 # TODO: pass this to the llm later 
@@ -37,24 +38,26 @@ quantization_config = BitsAndBytesConfig(
 
 cfg = BeniConfig(
     vision_name_or_path = "google/siglip-so400m-patch14-384",
-    text_name_or_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    #text_name_or_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    text_name_or_path = "HuggingFaceTB/SmolLM-360M-Instruct",
     vision_cls = "SiglipVisionModel",
     vision_processor_cls = "SiglipImageProcessor",
-    r = 11,
+    r = 9,
     freeze = True,
+    use_cls = True,
     attn_implementation="sdpa",
-    img_size = 448,
+    img_size = 384,
+    feature_select_index = -1,
 )
 
 # defined globally
 model = Beni(cfg)
-step = 1200
-model.connector.load_state_dict(torch.load(f"../src/model_checkpoints/finetune/tinyllama1b-siglip400m-ft-connector-step{step}.pt")) 
-model.llm = PeftModel.from_pretrained(model.llm, f"../src/model_checkpoints/finetune/tinyllama1b-siglip400m-ft-step{step}")
-model.llm = model.llm.merge_and_unload()
-#model.to(torch.float16)
-model.to("cuda")
+model = load_model(model, ckpt_dir=os.getenv("MODEL_CHECKPOINT", None))
+device = "cuda"
+model.to(device)
 model.eval()
+
+print(model)
 
 torch.cuda.empty_cache()
 
@@ -90,7 +93,7 @@ curl https://api.openai.com/v1/chat/completions \
   }'
 """
 
-def apply_chat_template(messages, eos_token):
+def apply_chat_template(messages, tokenizer):
     # assume single turn convo (update later)
     msg = [m['content'] for m in messages if m['role'] == 'user'][0]
 
@@ -106,7 +109,13 @@ def apply_chat_template(messages, eos_token):
     else:
         text = msg
 
-    text = text + eos_token + '\n'
+    if len(text) == 0:
+        text = None
+    if text is not None:
+        #text = text + tokenizer.eos_token + '\n' # custom template i made
+        convo = [{'role': 'user', 'content': text}]
+        text = tokenizer.apply_chat_template(convo, tokenize=False)  # tokenizer's built-in chat template
+
     return text, url
 
 
@@ -114,7 +123,7 @@ def apply_chat_template(messages, eos_token):
 
 def parse_request(request, tokenizer):
   parsed = {}
-  msg, img_url = apply_chat_template(request["messages"], tokenizer.eos_token)
+  msg, img_url = apply_chat_template(request["messages"], tokenizer)
    
   if img_url is not None:
       if img_url.startswith("http"):
@@ -150,14 +159,18 @@ def parse_into_generation_kwargs(req):
       gen_kwargs[k] = v
   return gen_kwargs
 
+
 def chat_completion(model, prompt, image = None, **generation_kwargs):
     with torch.no_grad():
         inputs = {}
-        if len(prompt)>0:
-            inputs = model.tok(prompt, return_tensors = 'pt').to("cuda").to(torch.float16)
+        if prompt is not None:
+            print('theres text')
+            inputs = model.tokenizer(prompt, return_tensors = 'pt').to(device).to(torch.float16)
 
         if image is not None:
+            print('theres image')
             inputs['images'] = [image,]
+
 
         out = model.generate(
             **inputs, 
@@ -165,13 +178,21 @@ def chat_completion(model, prompt, image = None, **generation_kwargs):
         )
 
         torch.cuda.empty_cache()
-        generated = model.tok.batch_decode(out, skip_special_tokens = True)[0]
+        generated = model.tokenizer.batch_decode(out, skip_special_tokens = True)[0]
 
     # metrics 
     usage = {}
-    usage['prompt_tokens'] = inputs['input_ids'].shape[1] + model.n_img_prompt_tokens
-    usage['completion_tokens'] = out.shape[1] - inputs['input_ids'].shape[1]
-    usage['total_tokens'] = out.shape[1]
+    #if hasattr(inputs, 'input_ids'):
+    #    usage['prompt_tokens'] = inputs['input_ids'].shape[1] + model.n_img_prompt_tokens
+    #    usage['completion_tokens'] = out.shape[1] - inputs['input_ids'].shape[1]
+    #    usage['total_tokens'] = out.shape[1]
+    #else:
+    #    usage['prompt_tokens'] = model.n_img_prompt_tokens
+    #    usage['completion_tokens'] = out.shape[1] 
+    #    usage['total_tokens'] = out.shape[1]
+    usage['prompt_tokens'] = 42
+    usage['completion_tokens'] = 42
+    usage['total_tokens'] = 42
 
     # choices 
     choices = [{
@@ -207,7 +228,7 @@ if __name__ == "__main__":
       data = request.json
 
       # parse
-      parsed = parse_request(data, model.tok)
+      parsed = parse_request(data, model.tokenizer)
       generation_kwargs = parse_into_generation_kwargs(data)
 
       prompt = parsed['prompt']

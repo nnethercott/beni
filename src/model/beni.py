@@ -1,5 +1,5 @@
 from dataclasses import dataclass, asdict, field
-from typing import Callable, Optional, List, Tuple, Union, Any
+from typing import Callable, Optional, List, Tuple, Union, Any, Callable
 from PIL import Image
 import functools
 import os
@@ -117,11 +117,15 @@ class BeniConfig:
     text_cls: str = 'AutoModelForCausalLM'
     vision_processor_cls: str = None
     r: int = 4
+    feature_select_index: int = -1
+    use_cls: bool = False
     freeze: bool = True
     attn_implementation: str = "eager"
     img_size: Optional[Union[dict, int]]=None
     text_config=None
     vision_config=None
+    sparsity_plugins: List[dict] = None #list of configs
+    chat_template: str = None
 
     # Attributes to be set in post_init
     text_config: Any = field(init=False)
@@ -173,15 +177,12 @@ class Beni(nn.Module):
 
     def freeze(self):
         for p in self.parameters():
-            p.requires_grad = False
+            p.requires_grad = False  # freeze all params
 
         for p in self.connector.parameters():
-            p.requires_grad = True
+            p.requires_grad = True  # connector trainable
 
-        if self.config.perceiver_config is not None:
-            for p in self.vision.resampler.parameters():
-                p.requires_grad = True
-
+        self.vision.unfreeze()  # vision trainable
 
     @property
     def text_config(self):
@@ -207,11 +208,6 @@ class Beni(nn.Module):
         if isinstance(self.llm, PeftModel):
             return self.llm.model.model.embed_tokens
         return self.llm.model.embed_tokens
-
-    @property
-    def n_img_prompt_tokens(self):
-        # TODO: compute this here 
-        return 93
 
 
     def prepare_inputs(
@@ -390,7 +386,7 @@ if __name__ == "__main__":
     )
     #perceiver_config = None
     model_config = BeniConfig(
-        perceiver_config = perceiver_config,
+        perceiver_config = None,
         vision_name_or_path = "google/siglip-so400m-patch14-384",
         text_name_or_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         vision_cls = "SiglipVisionModel",
@@ -398,26 +394,19 @@ if __name__ == "__main__":
         freeze = True,
         attn_implementation = "eager",
         img_size = 384,
-        r = 1, #don't use this with perceiver 
+        r = 8, #don't use this with perceiver 
+        sparsity_plugins = [GumbelConfig(hidden_size=1152, temperature=0.1, p=0.3, lam=0.5)],
     )
     beni = Beni(model_config)
     print(beni)
-
-    step = 10400
-    beni.connector.load_state_dict(torch.load(f"./model_checkpoints/perceiver_test/test-connector-step{step}.pt")) 
-    beni.vision.resampler.load_state_dict(torch.load(f"./model_checkpoints/perceiver_test/test-resampler-step{step}.pt"))
-
-    #beni.llm = PeftModel.from_pretrained(beni.llm, f"./model_checkpoints/tinyllama1b-siglip400m-ft-step{step}")
-    #beni.llm = beni.llm.merge_and_unload()
     beni.to("cuda")
-    print(beni)
 
 
     inputs = {}
-    img = Image.open(io.BytesIO(requests.get("https://t4.ftcdn.net/jpg/06/09/71/31/360_F_609713150_riuPh8tilEhIjkZ6OrgJOhvedDwN1Cer.jpg").content)).convert("RGB")
-    #sentence = "what is this?"
-    #template = "{prompt}</s>\n"
-    #inputs = beni.tokenizer(template.format(prompt=sentence), return_tensors='pt')
+    img = Image.open(io.BytesIO(requests.get("https://c.files.bbci.co.uk/C8AF/production/_120357315_moshpit_crowdsurfer_gettyimages_976.jpg").content)).convert("RGB")
+    sentence = "what is this?"
+    template = "{prompt}</s>\n"
+    #inputs = beni.tok(template.format(prompt=sentence), return_tensors='pt')
     inputs['images'] = [img,]
 
     for k, v in inputs.items():
@@ -426,5 +415,6 @@ if __name__ == "__main__":
 
     out = beni.generate(**inputs, max_new_tokens = 256, do_sample=False, num_beams=3, num_return_sequences=1)
     print(beni.tokenizer.batch_decode(out))
+
 
 

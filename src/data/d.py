@@ -27,9 +27,9 @@ def tiny_shakespeare(tok, slen = 512):
     return ds
     
 
-def load_recap(tok, n=100):
+def load_recap(tok, n=100, skip=0, template = None):
     """
-    some samples won't download so we'll have to delete those
+    our pretraining/alignment data for making llm understand text
     """
     data = datasets.load_dataset(
         "UCSC-VLAA/Recap-DataComp-1B",
@@ -40,19 +40,27 @@ def load_recap(tok, n=100):
 
     data = data.rename_columns({'re_caption': 'response'})
     
-    # some pretty trash images - but their values are broken
-    def preprocess(samples):
-        samples = samples.filter(lambda x: x['re_clip_score']>0.85)
-        return samples
+    # load 
+    data = data.skip(skip).take(n)
+    def dataset_generator(dataset):
+        yield from dataset
+    data = datasets.Dataset.from_generator(functools.partial(dataset_generator, data))
 
-    data = load_data_from_generator(data, tok, n=n, skip=100000, ctx_len = (196-91-2), preprocess=None)
+    # no prompt
+    def preprocess(samples):
+        samples['prompt'] = ['']*len(samples['response'])
+        return samples
+    data = data.map(preprocess, batched=True)
+
+    data = apply_chat_template(data, tok, ctx_len = 320, template = template)
     data = data.to_list()
     return LazyCustomDatasetForImages(data)
+    #return CustomDataset(data)
 
 
-def load_allava_laion(tok, n=100):
+def load_allava_laion(tok, n=100, template = None):
     """
-    provides text-only and image-text datasets
+    image-text SFT dataset
     """
     data = datasets.load_dataset(
         "FreedomIntelligence/ALLaVA-4V",
@@ -62,28 +70,33 @@ def load_allava_laion(tok, n=100):
         token=os.environ["HF_ACCESS_TOKEN"],
     )
 
-    def preprocess(data):
-        def batch_fn(samples):
-            # build prompt and answer cols 
-            convo = samples['conversations']
-            human = [c[0]['value'] for c in convo]
-            ai = [c[1]['value'] for c in convo]
+    # load n
+    data = data.take(n)
+    def dataset_generator(dataset):
+       yield from dataset
+    data = datasets.Dataset.from_generator(functools.partial(dataset_generator, data))
 
-            # remove llava image tag
-            human = [re.sub('<image>', '', h).strip() for h in human]
+    def batch_fn(samples):
+        # build prompt and answer cols 
+        convo = samples['conversations']
+        human = [c[0]['value'] for c in convo]
+        ai = [c[1]['value'] for c in convo]
 
-            samples['prompt'] = human
-            samples['response'] = ai
-            return samples
-        return data.map(batch_fn, batched=True)
+        # remove llava image tag
+        human = [re.sub('<image>', '', h).strip() for h in human]
 
+        samples['prompt'] = human
+        samples['response'] = ai
+        return samples
 
-    data = load_data_from_generator(data, tok, n=n, ctx_len = (256-93-2), preprocess=preprocess)
+    data = data.map(batch_fn, batched=True)
+
+    data = apply_chat_template(data, tok, ctx_len = (320-93-2), template=template)
     data = data.to_list()
     return LazyCustomDatasetForImages(data)
 
 
-def load_allava_text(tok, n=100):
+def load_allava_text(tok, n=100, template = None):
     """
     provides text-only and image-text datasets
     """
@@ -95,32 +108,38 @@ def load_allava_text(tok, n=100):
         token=os.environ["HF_ACCESS_TOKEN"],
     )
 
-    def preprocess(data):
-        def batch_fn(samples):
-            # build prompt and answer cols 
-            convo = samples['conversations']
-            human = [c[0]['value'] for c in convo]
-            ai = [c[1]['value'] for c in convo]
-            samples['prompt'] = human
-            samples['response'] = ai
-            return samples
-        return data.map(batch_fn, batched=True)
+    # load n
+    data = data.take(n)
+    def dataset_generator(dataset):
+       yield from dataset
+    data = datasets.Dataset.from_generator(functools.partial(dataset_generator, data))
+
+    def preprocess(samples):
+        # build prompt and answer cols 
+        convo = samples['conversations']
+        human = [c[0]['value'] for c in convo]
+        ai = [c[1]['value'] for c in convo]
+        samples['prompt'] = human
+        samples['response'] = ai
+        return samples
 
 
-    data = load_data_from_generator(data, tok, n=n, ctx_len = 256, truncate=False, preprocess=preprocess)
+    # preprocess
+    data = data.map(preprocess, batched=True)
+
+    data = apply_chat_template(data, tok, ctx_len = 320, template=template)
     data = data.to_list()
     return CustomDataset(data)
 
+
 if __name__ == "__main__":
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-360M-Instruct")
 
-    dst = load_allava_text(tok, n=100)
-    dsv = load_allava_laion(tok, n=100)
-    dlt = DataLoader(dst, batch_size = 2, collate_fn = functools.partial(sft_collate_fn, tok=tok))
-    dlv = DataLoader(dsv, batch_size = 4, collate_fn = functools.partial(sft_collate_fn, tok=tok))
+    template = tok.bos_token + "user\n{prompt}" + tok.eos_token + "assistant\n"
+    d = load_allava_text(tok, n=100, template=template)
     
-    ml = MultiDataLoader(dlv, dlt)
+    ml = MultiDataLoader(d)
     batch = next(iter(ml))
     #print(batch)
     

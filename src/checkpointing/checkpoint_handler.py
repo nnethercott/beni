@@ -5,6 +5,9 @@ from pathlib import Path
 from datetime import datetime
 import torch
 import time
+import os
+
+from peft import PeftModel
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -265,3 +268,85 @@ def load_sharded_model_single_gpu(model,model_path):
     
     print(f"Sharded state checkpoint loaded from {model_path}")
     return model
+
+
+def load_model(model, ckpt_dir, trainable: bool = True):
+    """
+    loads various model components based on 
+    """
+
+    weight_paths = [os.path.join(ckpt_dir, f) for f in os.listdir(ckpt_dir)]
+
+    for f in weight_paths:
+        if 'connector.pt' in f:
+            print("loading connector...")
+            model.connector.load_state_dict(torch.load(f))
+        elif 'loras' in f:
+            print("loading loras...")
+            model.llm = PeftModel.from_pretrained(model.llm, f, is_trainable=trainable) #`is_trainable` is for training
+            model.llm = model.llm.merge_and_unload()
+        elif 'sparsity.pt' in f:
+            print("loading sparsity...")
+            model.vision.sparsity.load_state_dict(torch.load(f))
+        else:
+            pass
+    return model
+
+
+def save_model(model, 
+               save_dir=None, 
+               rank: int = 0,
+               fsdp_checkpoint_type: StateDictType = StateDictType.FULL_STATE_DICT
+               ):
+    if save_dir is None:
+        return
+
+    # create dir
+    if rank == 0:
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
+
+    # llm loras
+    if isinstance(model.llm, PeftModel):
+        if rank == 0:
+            print(f"saving LoRAs to {save_dir}...")
+        model.llm.save_pretrained(f"{save_dir}/loras")
+
+    # connector and resampler
+    if dist.is_initialized():
+        with FSDP.state_dict_type(
+                model, 
+                fsdp_checkpoint_type,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            ):
+                connector_cpu_state = model.connector.state_dict()
+                if rank == 0:
+                    print(f"saving connector to {save_dir}...")
+                    torch.save(connector_cpu_state, f"{save_dir}/connector.pt")
+
+                # resampler
+                if model.config.perceiver_config is not None:
+                    resampler_cpu_state = model.vision.resampler.state_dict()
+                    if rank == 0:
+                        print(f"saving perceiver resampler to {save_dir}...")
+                        torch.save(resampler_cpu_state, f"{save_dir}/resampler.pt")
+
+                # sparsity 
+                if model.config.sparsity_plugins is not None:
+                    sparsity_cpu_state = model.vision.sparsity.state_dict()
+                    if rank == 0:
+                        print(f"saving perceiver resampler to {save_dir}...")
+                        torch.save(sparsity_cpu_state , f"{save_dir}/sparsity.pt")
+    else:
+        print(f"saving connector to {save_dir}...")
+        torch.save(model.connector.state_dict(), f"{save_dir}/connector.pt")
+
+        if model.config.perceiver_config is not None:
+            resampler_cpu_state = model.vision.resampler.state_dict()
+            print(f"saving perceiver resampler to {save_dir}...")
+            torch.save(model.resampler.state_dict(), f"{save_dir}/resampler.pt")
+
+        if model.config.sparsity_plugins is not None:
+            sparsity_cpu_state = model.vision.sparsity.state_dict()
+            print(f"saving perceiver resampler to {save_dir}...")
+            torch.save(sparsity_cpu_state , f"{save_dir}/sparsity.pt")

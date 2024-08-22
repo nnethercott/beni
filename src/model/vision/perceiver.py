@@ -42,48 +42,48 @@ if is_flash_attn_2_available():
 
 
 from transformers import PretrainedConfig
-#class PerceiverResamplerConfig(PretrainedConfig):
-#
-#    def __init__(
-#        self, 
-#        hidden_size: int,
-#        rms_norm_eps: float = 1e-06,
-#        n_latents: int = 64,
-#        hidden_act: str = "silu",
-#        depth: int = 1,
-#        n_heads: int = 32, 
-#        head_dim: int = 96,
-#        n_query_groups: int = 1,
-#        concat_latents_kv: bool = False,
-#        attention_dropout: float = 0.0,
-#        **kwargs
-#    ):
-#        super().__init__(**kwargs)
-#
-#        self.rms_norm_eps = rms_norm_eps 
-#        self.n_latents=n_latents
-#        self.hidden_size = hidden_size
-#        self.hidden_act = hidden_act
-#        self.depth = depth
-#        self.n_heads = n_heads
-#        self.head_dim = head_dim
-#        self.n_query_groups = n_query_groups
-#        self.concat_latents_kv = concat_latents_kv
-#        self.attention_dropout = attention_dropout
+class PerceiverResamplerConfig(PretrainedConfig):
+
+    def __init__(
+        self, 
+        hidden_size: int,
+        rms_norm_eps: float = 1e-06,
+        n_latents: int = 64,
+        hidden_act: str = "silu",
+        depth: int = 1,
+        n_heads: int = 32, 
+        head_dim: int = 96,
+        n_query_groups: int = 1,
+        concat_latents_kv: bool = False,
+        attention_dropout: float = 0.0,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+
+        self.rms_norm_eps = rms_norm_eps 
+        self.n_latents=n_latents
+        self.hidden_size = hidden_size
+        self.hidden_act = hidden_act
+        self.depth = depth
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.n_query_groups = n_query_groups
+        self.concat_latents_kv = concat_latents_kv
+        self.attention_dropout = attention_dropout
 
 
-@dataclass
-class PerceiverResamplerConfig:
-    hidden_size: int 
-    rms_norm_eps: float = 1e-06
-    n_latents: int = 64
-    hidden_act: str = "silu"
-    depth: int = 1
-    n_heads: int = 32
-    head_dim: int = 96
-    n_query_groups: int = 1
-    concat_latents_kv: bool = False
-    attention_dropout: float = 0.0
+#@dataclass
+#class PerceiverResamplerConfig:
+#    hidden_size: int 
+#    rms_norm_eps: float = 1e-06
+#    n_latents: int = 64
+#    hidden_act: str = "silu"
+#    depth: int = 1
+#    n_heads: int = 32
+#    head_dim: int = 96
+#    n_query_groups: int = 1
+#    concat_latents_kv: bool = False
+#    attention_dropout: float = 0.0
 
 
 class MLP(nn.Module):

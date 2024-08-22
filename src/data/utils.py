@@ -26,7 +26,14 @@ IDEA:
 class CustomDataset(Dataset):
     def __init__(self, data):
         #TODO: sorted(data, key=lambda x: len(x['input_ids'])) 
-        self.data = data
+        if torch.distributed.is_initialized():
+            rank = int(os.environ["LOCAL_RANK"])
+            world_size = int(os.environ["WORLD_SIZE"])
+            block_size = len(data)//world_size
+            self.data = data[rank*block_size:(rank+1)*block_size] #drop len(data)%block_size samples
+        else:
+            self.data = data
+
     def __len__(self):
         return len(self.data)
     def __getitem__(self, i):
@@ -65,7 +72,7 @@ class CustomDatasetForImages(CustomDataset):
         def download(idx, url):
             try:
                 img = self.get_image(url)
-                if not len(img.size)==2 or img.size[:2] == (1,1):  # edge cases
+                if not len(img.size)==2 or img.size[:2] <= (1,1):  # edge cases
                     return (idx, None)
 
                 if self.cache:
@@ -74,7 +81,7 @@ class CustomDatasetForImages(CustomDataset):
             except:
                 return (idx, None)
 
-        with ThreadPoolExecutor(max_workers = int(os.environ.get("OMP_NUM_THREADS", 8))) as executor:
+        with ThreadPoolExecutor(max_workers = int(os.environ.get("OMP_NUM_THREADS", 16))) as executor:
             res = list(tqdm(executor.map(lambda args: download(*args), urls_enumed), total=len(urls_enumed)))
 
         # remove bad ids from data 
@@ -83,6 +90,8 @@ class CustomDatasetForImages(CustomDataset):
         bad_ids = sorted(bad_ids)[::-1]
         for idx in bad_ids:
             self.data.pop(idx)
+
+        return self
 
     def trim(self):
         if torch.distributed.is_initialized():
@@ -218,15 +227,13 @@ def sft_collate_fn(inputs, tok):
     }
 
 
-# TODO: move to format with conversation entries ?
-def load_data_from_generator(data: datasets.Dataset, 
-                             tok, 
-                             n: int = 100, 
-                             skip: int = 0,
-                             ctx_len: int = 384,
-                             truncate: bool = False,
-                             preprocess: Callable[[datasets.Dataset,],datasets.Dataset]=None,
-                             ):
+def apply_chat_template(
+        data: datasets.Dataset, 
+        tok, 
+        ctx_len: int = 384,
+        truncate: bool = False,
+        template = None,
+):
     """
     Arguments:
         - data: lazy dataset loaded with `streaming=True`. dataset should have column 'response'. if no 'prompt' present we use ''
@@ -241,34 +248,21 @@ def load_data_from_generator(data: datasets.Dataset,
         - adds EOS token to the end of each text entry -> formats like SOS+encoded+EOS
             - ensures free lunch with pure-text datasets, image ones handled by vlm 
     """
+    if template is None:
+        template = tok.bos_token + "{prompt}\n" + tok.eos_token # <s>prompt\n</s>
 
-    template = "{prompt}{response}"+tok.eos_token
-
-    # load
-    data = data.skip(skip).take(n)
-    def dataset_generator(dataset):
-        yield from dataset
-    data = datasets.Dataset.from_generator(functools.partial(dataset_generator, data))
-
-    # pre-processing
-    if preprocess is not None:
-        data = preprocess(data)
-
+    
     def process(samples):
-        if 'prompt' in samples.keys():
-            prompts = [p + tok.eos_token + '\n' for p in samples['prompt']] #<s><img></img>prompt</s>\nanswer</s>
-            prompt_len = [len(tok.encode(p)) for p in prompts] # add \n 
-        else:
-            prompts = ['']*len(samples['response'])
-            prompt_len = [0 for _ in prompts] # 1 for the 
+        prompts = [template.format(prompt=p) for p in samples['prompt']] 
+        prompt_len = [len(tok.encode(p, add_special_tokens=False)) for p in prompts] # add \n 
 
-        resp = samples['response']
-        inputs = [template.format(prompt=p, response=r).strip() for p,r in zip(prompts,resp)]
+        responses = samples['response']
+        inputs = [p + r + tok.eos_token for p,r in zip(prompts,responses)]
 
         if truncate:
-            input_ids = [tok.encode(i)[:ctx_len] for i in inputs]
+            input_ids = [tok.encode(i, add_special_tokens=False)[:ctx_len] for i in inputs]
         else:
-            input_ids = [tok.encode(i) for i in inputs]
+            input_ids = [tok.encode(i, add_special_tokens=False) for i in inputs]
 
         samples['input_ids'] = input_ids
         samples['prompt_len'] = prompt_len

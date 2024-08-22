@@ -75,7 +75,7 @@ CSS ="""
 
 # Gradio interface components
 with gr.Blocks(theme=theme) as demo:
-    gr.Markdown("# 🦙 Beni vision-language demo")
+    gr.Markdown("# 🦙 chatbot demo")
 
     with gr.Row():
         with gr.Column(scale=2):
