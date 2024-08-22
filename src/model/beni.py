@@ -416,5 +416,16 @@ if __name__ == "__main__":
     out = beni.generate(**inputs, max_new_tokens = 256, do_sample=False, num_beams=3, num_return_sequences=1)
     print(beni.tokenizer.batch_decode(out))
 
+    #out = beni(**inputs)
+    #loss = out['loss']
+    #loss.backward()
+
+    #for p in beni.connector.parameters():
+    #    print(p.grad)
+    #
+    #optimizer.step()
+    #optimizer.zero_grad()
+
+
 
 

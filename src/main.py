@@ -205,6 +205,7 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
 
     # recover rank 
     rank = int(os.getenv("LOCAL_RANK", 0))
+    offset = 16710
 
     total_len = len(dl)
     start_time = time.time()
@@ -262,8 +263,6 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
     # save on epoch end 
     save_dir = os.path.join(c.save_path, f"step{total_len}")
     save_model(model, save_dir=save_dir, rank=rank, fsdp_checkpoint_type = fsdp_config.checkpoint_type)
-                        
-
 
 if __name__ == "__main__":
     setup()

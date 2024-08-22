@@ -129,6 +129,9 @@ Test these with same random seed over same datasets for fixed training steps
         * i think we'd have to do a pretraining to determine the weights of the gating network and then when we finetune for real we can igore any token which is "turned off" by dropping it from the sequence. otherwise we can't jointly train the network on dynamically-determined variable-length sequences 
         * *need to override the positional embeddings of zeroed out patches during pretraining i think* maybe
 
+        
+
+        
 
         
 
