@@ -2,6 +2,8 @@ from .utils import *
 import datasets
 import re
 
+NUM_IMG_TOKENS=93
+MAX_LEN=256
 
 # a test dataset for llms
 def tiny_shakespeare(tok, slen = 512):
@@ -27,7 +29,7 @@ def tiny_shakespeare(tok, slen = 512):
     return ds
     
 
-def load_recap(tok, n=100, skip=0, template = None):
+def load_recap(tok, n=100, skip=0, prompt_template=None, response_template=None):
     """
     our pretraining/alignment data for making llm understand text
     """
@@ -52,13 +54,13 @@ def load_recap(tok, n=100, skip=0, template = None):
         return samples
     data = data.map(preprocess, batched=True)
 
-    data = apply_chat_template(data, tok, ctx_len = 320, template = template)
+    data = apply_chat_template(data, tok, ctx_len = MAX_LEN-NUM_IMG_TOKENS, prompt_template=prompt_template, response_template=response_template)
     data = data.to_list()
     return LazyCustomDatasetForImages(data)
     #return CustomDataset(data)
 
 
-def load_allava_laion(tok, n=100, template = None):
+def load_allava_laion(tok, n=100, prompt_template=None, response_template=None):
     """
     image-text SFT dataset
     """
@@ -91,12 +93,12 @@ def load_allava_laion(tok, n=100, template = None):
 
     data = data.map(batch_fn, batched=True)
 
-    data = apply_chat_template(data, tok, ctx_len = (320-93-2), template=template)
+    data = apply_chat_template(data, tok, ctx_len = MAX_LEN-NUM_IMG_TOKENS, prompt_template=prompt_template, response_template=response_template)
     data = data.to_list()
     return LazyCustomDatasetForImages(data)
 
 
-def load_allava_text(tok, n=100, template = None):
+def load_allava_text(tok, n=100, prompt_template=None, response_template=None):
     """
     provides text-only and image-text datasets
     """
@@ -127,7 +129,7 @@ def load_allava_text(tok, n=100, template = None):
     # preprocess
     data = data.map(preprocess, batched=True)
 
-    data = apply_chat_template(data, tok, ctx_len = 320, template=template)
+    data = apply_chat_template(data, tok, ctx_len = MAX_LEN, prompt_template=prompt_template, response_template=response_template)
     data = data.to_list()
     return CustomDataset(data)
 

@@ -9,6 +9,7 @@ import wandb
 class WandbConfig:
     project: str = 'beni' # wandb project name
     entity: Optional[str] = "nnethercott" # wandb entity name
+    name: Optional[str] = None
     enable: bool = False
     job_type: Optional[str] = None
     tags: Optional[List[str]] = None

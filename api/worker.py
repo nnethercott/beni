@@ -109,12 +109,15 @@ def apply_chat_template(messages, tokenizer):
     else:
         text = msg
 
-    if len(text) == 0:
-        text = None
-    if text is not None:
+    #if len(text) == 0:
+    #    text = None
+    #if text is not None:
         #text = text + tokenizer.eos_token + '\n' # custom template i made
-        convo = [{'role': 'user', 'content': text}]
-        text = tokenizer.apply_chat_template(convo, tokenize=False)  # tokenizer's built-in chat template
+
+    convo = [{'role': 'user', 'content': text}]
+    text = tokenizer.apply_chat_template(convo, tokenize=False)  # tokenizer's built-in chat template
+    #template = "<|im_start|>user\n{prompt}<|im_end|>assistant\n"
+    #text = template.format(prompt=text)
 
     return text, url
 
@@ -165,7 +168,7 @@ def chat_completion(model, prompt, image = None, **generation_kwargs):
         inputs = {}
         if prompt is not None:
             print('theres text')
-            inputs = model.tokenizer(prompt, return_tensors = 'pt').to(device).to(torch.float16)
+            inputs = model.tokenizer(prompt, return_tensors = 'pt', add_special_tokens=False).to(device)
 
         if image is not None:
             print('theres image')
@@ -233,6 +236,8 @@ if __name__ == "__main__":
 
       prompt = parsed['prompt']
       image = parsed['image']
+
+      print(prompt)
         
       return chat_completion(model, prompt, image, **generation_kwargs)
       

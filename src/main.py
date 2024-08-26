@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, List 
 import copy
 import json
+import uuid
 
 import torch
 import torch.distributed as dist
@@ -28,25 +29,31 @@ from torch.distributed.fsdp.wrap import (
     size_based_auto_wrap_policy,
 )
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, HfArgumentParser
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, HfArgumentParser, BitsAndBytesConfig
 
 # fsdp layers
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.clip.modeling_clip import CLIPEncoderLayer
 from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
 from transformers.models.phi3.modeling_phi3 import Phi3DecoderLayer
-from model.vision import *
+from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+
 
 from peft import LoraConfig, get_peft_model, PeftModel
 
 # local 
+from model.vision import *
 from data import *
 from policies.wrapping import fsdp_auto_wrap_policy, get_llama_wrapper
+import policies
 from utils.train_utils import clear_gpu_cache, setup_environ_flags, get_cosine_schedule_with_warmup
 from configs import TrainConfig, WandbConfig, FSDPConfig
 from checkpointing import save_model, load_model
 
 from model import Beni, BeniConfig
+
+TOKEN = os.getenv("HF_ACCESS_TOKEN", None)
+
 
 def seed_everything(seed=0):
     torch.manual_seed(seed)
@@ -84,9 +91,6 @@ def fsdp_main(model_config, **kwargs):
     seed_everything(rank)
 
     model_config_copy = copy.deepcopy(asdict(model_config))
-    _ = model_config_copy.pop("text_config") 
-    _ = model_config_copy.pop("vision_config")
-
     configs = {'model_config': model_config_copy, 'train_config': train_config, 'fsdp_config': fsdp_config, 'lora_config': lora_config}
     wandb_run = wandb_config.build_run(configs, rank==0)
 
@@ -97,11 +101,8 @@ def fsdp_main(model_config, **kwargs):
         setup_environ_flags(rank)
 
     if train_config.fsdp:
-        # load on cpu:0 only
         if rank == 0:
-            model = Beni(model_config) # cpu
-
-            # write model config
+            # save model config
             s = train_config.save_path
             if s is not None:
                 if not os.path.exists(s):
@@ -109,14 +110,21 @@ def fsdp_main(model_config, **kwargs):
                 with open(f"{s}/model_config.json", 'w') as f:
                     f.write(json.dumps(model_config_copy))
 
-            # load from checkpoint
-            if train_config.ckpt_path is not None:
-                print(f"loading state dict from {train_config.ckpt_path}...")
-                model = load_model(model, train_config.ckpt_path, trainable=True)
-
+        #quantized
+        if model_config.llm_quantization_config is not None:
+            model = Beni(model_config, hf_token=TOKEN)
         else:
-            with torch.device("meta"):
-                model = Beni(model_config)    
+            # load on cpu:0 only
+            if rank == 0:
+                model = Beni(model_config, hf_token=TOKEN) 
+
+                # load from checkpoint
+                if train_config.ckpt_path is not None:
+                    print(f"loading state dict from {train_config.ckpt_path}...")
+                    model = load_model(model, train_config.ckpt_path, trainable=True)
+            else:
+                with torch.device("meta"):
+                    model = Beni(model_config, hf_token = TOKEN)    
                 
         if train_config.enable_peft:
             assert lora_config is not None, "Either disable `enable_peft` or provide a valid lora config!"
@@ -144,11 +152,8 @@ def fsdp_main(model_config, **kwargs):
             policies.apply_fsdp_checkpointing(model)
 
     else:
-        model = Beni(model_config)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if train_config.ckpt_path is not None:
-            model.load_state_dict(torch.load(train_config.ckpt_path))
-        model.to(device)
+        #TODO add non fsdp training
+        pass
 
     if rank == 0:
         print(model)
@@ -158,10 +163,11 @@ def fsdp_main(model_config, **kwargs):
                 print(n)
     
     # data -- # TODO: move later
-    template = model.config.chat_template
-    dsr = load_recap(model.tokenizer, n = 300000, skip=400000, template = template)
-    dsl = load_allava_laion(model.tokenizer, n = 300000, template = template)
-    dst = load_allava_text(model.tokenizer, n = 300000, template = template)
+    prompt_template = model.config.prompt_template
+    response_template = model.config.response_template
+    dsr = load_recap(model.tokenizer, n = 10000, skip=0, prompt_template = prompt_template, response_template=response_template)
+    dsl = load_allava_laion(model.tokenizer, n = 10000, prompt_template = prompt_template, response_template=response_template)
+    #dst = load_allava_text(model.tokenizer, n = 3000, template = template)
 
     # shuffle per rank before multiloader creation 
     #witness something crazy:
@@ -174,12 +180,12 @@ def fsdp_main(model_config, **kwargs):
 
     dsr.data = sort_batch_shuffle(dsr.data, train_config.batch_size)
     dsl.data = sort_batch_shuffle(dsl.data, train_config.batch_size)
-    dst.data = sort_batch_shuffle(dst.data, train_config.batch_size)
+    #dst.data = sort_batch_shuffle(dst.data, train_config.batch_size)
 
     dsr = DataLoader(dsr, batch_size = train_config.batch_size, collate_fn = functools.partial(sft_collate_fn, tok=model.tokenizer), num_workers=1, pin_memory=True, shuffle=False)
     dsl = DataLoader(dsl, batch_size = train_config.batch_size, collate_fn = functools.partial(sft_collate_fn, tok=model.tokenizer), num_workers=1, pin_memory=True, shuffle=False)
-    dst = DataLoader(dst, batch_size = train_config.batch_size, collate_fn = functools.partial(sft_collate_fn, tok=model.tokenizer), num_workers=1, pin_memory=True, shuffle=False)
-    dl = MultiDataLoader(dsr, dsl, dst, seed = 42) #each rank should see same modality
+    #dst = DataLoader(dst, batch_size = train_config.batch_size, collate_fn = functools.partial(sft_collate_fn, tok=model.tokenizer), num_workers=1, pin_memory=True, shuffle=False)
+    dl = MultiDataLoader(dsr, dsl, seed = 42) #each rank should see same modality
 
     # optimizer
     optimizer = torch.optim.AdamW(
@@ -205,7 +211,6 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
 
     # recover rank 
     rank = int(os.getenv("LOCAL_RANK", 0))
-    offset = 16710
 
     total_len = len(dl)
     start_time = time.time()
@@ -281,32 +286,39 @@ if __name__ == "__main__":
         perceiver_config = None,
         vision_name_or_path = "google/siglip-so400m-patch14-384",
         #text_name_or_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        text_name_or_path = "HuggingFaceTB/SmolLM-360M-Instruct",
+        text_name_or_path = "google/gemma-2-2b-it",
         vision_cls = "SiglipVisionModel",
         vision_processor_cls = "SiglipImageProcessor",
         freeze = True,
-        attn_implementation = "sdpa",
+        attn_implementation = "eager",
         img_size = 384,
         r = 9, 
         feature_select_index = -1,
-        use_cls = True, # use first token with siglip
-        #sparsity_plugins = [GumbelConfig(hidden_size=1152, temperature=0.1, p=0.5, lam=1.0)],
+        use_cls = True, 
         sparsity_plugins = None,
-        chat_template = "<|im_start|>user\n{prompt}<|im_end|>assistant\n", # smol chat template
+        bos_token = "<bos><start_of_turn>",
+        prompt_template = "<bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n", #all tokens we want no loss on
+        response_template = "{response}<end_of_turn><eos>",
+        #llm_quantization_config = BitsAndBytesConfig(
+        #    load_in_4bit = True, 
+        #    bnb_4bit_compute_dtype=torch.float16, 
+        #    bnb_4bit_quant_type="nf4",
+        #    bnb_4bit_quant_storage=torch.float16,
+        #),
     )
 
     train_config = TrainConfig(
         warmup_ratio = 0.03,
-        batch_size = 8,
+        batch_size = 1,
         gradient_accumulation_steps = 4,
         lr = 4e-04,
-        weight_decay = 0.1,
-        min_lr = 1e-05,
+        weight_decay = 0.0,
+        min_lr = 4e-05,
         grad_clip = 1.0,
-        save_steps = 900,
+        save_steps = 500,
         log_steps = 1,
-        ckpt_path = "./model_checkpoints/smol-360M/step12500/",
-        save_path = "./model_checkpoints/smol-360M-instruct/",
+        ckpt_path = None,
+        save_path = "./model_checkpoints/gemma2-pt-test/",
         betas = [0.9, 0.999],
         fsdp=True,
         enable_peft=True,
@@ -314,12 +326,15 @@ if __name__ == "__main__":
 
     # need this for weight tying: torch.nn.Embedding, # if we upscale images we can't fsdp the positional embeddings ?
     fsdp_config = FSDPConfig(
-            transformer_cls=(LlamaDecoderLayer, SiglipEncoderLayer, PerceiverResampler, nn.Embedding), 
+            transformer_cls=(Gemma2DecoderLayer, SiglipEncoderLayer, PerceiverResampler, nn.Embedding, VisionTower), 
+            fsdp_activation_checkpointing=True,
+            fsdp_cpu_offload = True,
     )
     wandb_config = WandbConfig(
         enable = True,
-        project = "smol",
+        project = "vlm",
         entity = "nnethercott",
+        name = model_config.text_name_or_path.split("/")[-1].lower()+"-" + str(uuid.uuid1()).split("-")[-1] # model-archi-uuid
     )
     lora_config = LoraConfig(r=8, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none')
     #lora_config = None

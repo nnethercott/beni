@@ -232,7 +232,8 @@ def apply_chat_template(
         tok, 
         ctx_len: int = 384,
         truncate: bool = False,
-        template = None,
+        prompt_template = None,
+        response_template = None,
 ):
     """
     Arguments:
@@ -248,16 +249,18 @@ def apply_chat_template(
         - adds EOS token to the end of each text entry -> formats like SOS+encoded+EOS
             - ensures free lunch with pure-text datasets, image ones handled by vlm 
     """
-    if template is None:
-        template = tok.bos_token + "{prompt}\n" + tok.eos_token # <s>prompt\n</s>
+    if prompt_template is None:
+        prompt_template = tok.bos_token + "{prompt}" + tok.eos_token # <s>prompt</s>
+    if response_template is None:
+        response_template = "{response}" + tok.eos_token
 
-    
+
     def process(samples):
-        prompts = [template.format(prompt=p) for p in samples['prompt']] 
-        prompt_len = [len(tok.encode(p, add_special_tokens=False)) for p in prompts] # add \n 
+        prompts = [prompt_template.format(prompt=p) for p in samples['prompt']] 
+        responses = [response_template.format(response=r) for r in samples['response']]
+        inputs = [p + r for p,r in zip(prompts,responses)]
 
-        responses = samples['response']
-        inputs = [p + r + tok.eos_token for p,r in zip(prompts,responses)]
+        prompt_len = [len(tok.encode(p, add_special_tokens=False)) for p in prompts] 
 
         if truncate:
             input_ids = [tok.encode(i, add_special_tokens=False)[:ctx_len] for i in inputs]

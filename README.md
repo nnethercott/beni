@@ -37,9 +37,11 @@
 * [x] make `BeniConfig` subclass hf config so we can peft beni and `.save_pretrained`
 * [x] add a demo subdir with docker compose for spinning up model worker, flask server, and gradio app [15/08/24]
     * [this commit](https://github.com/Deepomatic/vlm_dev/commit/ffc2e11e57aaac8ec63679978cbedef44bba3e41)
-* [ ] something important i forgot
 * [ ] check perf of normal computer vision models like resnet
 * [ ] `torch.jit.trace` model forward pass and check idle vs nonidle time 
+* [ ] quantized/qlora training
+    * need to make `quant_storage_type` same as `compute_dtype` so layers get flattened properly in fsdp
+    * **need to add scaler and mixed precision decorators for llm forward call if quantization enabled**
 
 # Usage
 Training is configured parametrically using various config objects which get passed to a launch script. These configs allow for defining optional model components (e.g. the `PerceiverResamplerConfig`) and control aspects like model architecture and training hyperparameters.
@@ -143,3 +145,5 @@ Test these with same random seed over same datasets for fixed training steps
     * **or** make sure modality per iter is the same for each rank
 * on multimodal training data we should grad accumulate so that gradients contain info pertaining to all modalities before stepping (i think)
     * adamw maintains state so we have this mix-of-modalities step implicitly, but its best to be more clear
+
+* [invalid device ordinal](https://stackoverflow.com/questions/64334033/how-to-solve-runtimeerror-cuda-error-invalid-device-ordinal) might occur if you hard set `CUDA_VISIBLE_DEVICES` manually ?

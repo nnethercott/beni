@@ -125,18 +125,11 @@ class BeniConfig:
     text_config=None
     vision_config=None
     sparsity_plugins: List[dict] = None #list of configs
-    chat_template: str = None
-
-    # Attributes to be set in post_init
-    text_config: Any = field(init=False)
-    vision_config: Any = field(init=False)
-
-    def __post_init__(self):
-        self.text_config = AutoConfig.from_pretrained(self.text_name_or_path)
-        self.vision_config = AutoConfig.from_pretrained(self.vision_name_or_path)
-
-        if hasattr(self.vision_config, 'vision_config'):
-            self.vision_config = self.vision_config.vision_config
+    bos_token: str = None
+    eos_token: str = None
+    prompt_template: str = None
+    response_template: str = None
+    llm_quantization_config: Optional[Any] = None
 
 
 
@@ -145,9 +138,11 @@ class Beni(nn.Module):
     todo: 
         * allow for prompt templates
     """
-    def __init__(self, config: BeniConfig):
+    def __init__(self, config: BeniConfig, hf_token: None):
         super().__init__()
         self.config = config
+        self.token = hf_token
+
         self.build_vision_and_text(config)
 
         self.connector = Connector(self.vision_config.hidden_size, self.text_config.hidden_size)
@@ -166,8 +161,13 @@ class Beni(nn.Module):
         self.vision = VisionTower(v, p, config)
 
         # text
-        self.llm = text_cls.from_pretrained(config.text_name_or_path, attn_implementation=config.attn_implementation,)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.text_name_or_path)
+        self.llm = text_cls.from_pretrained(config.text_name_or_path, 
+                                            attn_implementation=config.attn_implementation, 
+                                            quantization_config = self.config.llm_quantization_config,
+                                            #torch_dtype = torch.float16,
+                                            token=self.token)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(config.text_name_or_path, token=self.token)
         self.tokenizer.padding_side = 'right'
         self.tokenizer.add_tokens(["<img>", "</img>"])
         
@@ -186,7 +186,7 @@ class Beni(nn.Module):
 
     @property
     def text_config(self):
-        return AutoConfig.from_pretrained(self.config.text_name_or_path)
+        return AutoConfig.from_pretrained(self.config.text_name_or_path, token=self.token)
 
     @property
     def vision_config(self):
@@ -237,7 +237,16 @@ class Beni(nn.Module):
         vision_embeds = self.connector(vision_embeds)
 
         # bos
-        bos_token = torch.tensor(self.tokenizer.bos_token_id, device=self.device).unsqueeze(0)
+        if self.config.bos_token is not None: 
+            tokens = self.tokenizer.encode(self.config.bos_token, add_special_tokens=False)
+            if not isinstance(tokens, list):
+                tokens = [tokens]
+            bos_token = torch.tensor(tokens, device=self.device)
+            bos_len = len(tokens)    
+        else:
+            bos_token = torch.tensor([self.tokenizer.bos_token_id], device=self.device)
+            bos_len = 1
+
         bos_embeds = self.embed_tokens(bos_token).repeat((bsz,1,1))
         
         # embed <img> and </img>
@@ -249,8 +258,8 @@ class Beni(nn.Module):
         if input_ids is not None:
             text_embeds = self.embed_tokens(input_ids) 
 
-            #<s><img>insert_image_featuers<img>prompt</s>
-            inputs_embeds = torch.cat((bos_embeds, img_embeds, vision_embeds, end_img_embeds, text_embeds[:,1:,:]), dim=1)
+            #<bos_seq><img>insert_image_featuers<img>prompt</s>
+            inputs_embeds = torch.cat((bos_embeds, img_embeds, vision_embeds, end_img_embeds, text_embeds[:,bos_len:,:]), dim=1)
             input_ids = None  # ensure input_ids is not passed to the model
 
             _, vis_len, _ = vision_embeds.shape
@@ -303,7 +312,6 @@ class Beni(nn.Module):
         #print(self.tokenizer.batch_decode(input_ids))
         input_ids, attention_mask, inputs_embeds, labels = self.prepare_inputs(input_ids, attention_mask, inputs_embeds, labels, images)
             
-        #print(kwargs)
         #print(attention_mask)
         #print(self.tokenizer.batch_decode(labels.masked_fill(labels==-100, self.tokenizer.encode('X', add_special_tokens=False)[0])))
 
