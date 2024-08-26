@@ -65,7 +65,7 @@ print(model)
 
 training_args = TrainingArguments(
     output_dir="./hf_test",
-    per_device_train_batch_size=1,
+    per_device_train_batch_size=4,
     gradient_accumulation_steps=1,
     learning_rate=4e-04,
     weight_decay=0.0,
@@ -125,15 +125,25 @@ def formatting_prompts_func(example):
 
 train_dataset = load_recap(
     model.tokenizer,
-    n=8,
-    skip=0,
+    n=1000,
 )
 
-trainer = Trainer(
+
+class MyTrainer(Trainer):
+    def get_train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.args.train_batch_size,
+            collate_fn=functools.partial(sft_collate_fn, tok=model.tokenizer),
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+        )
+
+
+trainer = MyTrainer(
     model=model,
     tokenizer=model.tokenizer,
     args=training_args,
-    data_collator=functools.partial(sft_collate_fn, tok=model.tokenizer),
     # max_seq_length=512,
     train_dataset=train_dataset,
     eval_dataset=None,
