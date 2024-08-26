@@ -11,38 +11,44 @@ data = datasets.load_dataset(
     token=os.environ["HF_ACCESS_TOKEN"],
 )
 
+
 def dataset_generator(dataset):
     yield from dataset
+
 
 data = data.take(150000)
 data = datasets.Dataset.from_generator(functools.partial(dataset_generator, data))
 
-#data = CustomDatasetForImages(data.to_list(), cache=True)
-#data.build()
+# data = CustomDatasetForImages(data.to_list(), cache=True)
+# data.build()
 
 # resolve downloaded images
 import json
+
 with open("./data/image_cache.json") as f:
     mapping = json.loads(f.read())
 
-# i'm dumb 
-mapping  = {v:k for k,v in mapping.items()}
+# i'm dumb
+mapping = {v: k for k, v in mapping.items()}
 feature = datasets.Image()
 
 urls = list(mapping.keys())
-data = data.filter(lambda d: d['url'] in urls)
+data = data.filter(lambda d: d["url"] in urls)
+
 
 def image_to_bytes(image_path):
-    with open(image_path, 'rb') as f:
+    with open(image_path, "rb") as f:
         return f.read()
 
+
 def add_images(samples):
-    urls = samples['url']
+    urls = samples["url"]
     images = [image_to_bytes(f"./data/data/{mapping[u]}.jpg") for u in urls]
-    samples['bytes'] = images
+    samples["bytes"] = images
     return samples
 
-data = data.map(add_images, batched = True)
+
+data = data.map(add_images, batched=True)
 
 import pandas as pd
 import pyarrow as pa
@@ -51,17 +57,16 @@ import pyarrow.parquet as pq
 breakpoint()
 df = pd.DataFrame(data.to_list())
 table = pa.Table.from_pandas(df)
-pq.write_table(table, './data/data/train.parquet')
+pq.write_table(table, "./data/data/train.parquet")
 
-# upload 
-#from huggingface_hub import HfApi, HfFolder
-#api = HfApi(token=os.environ["HF_ACCESS_TOKEN"])
+# upload
+# from huggingface_hub import HfApi, HfFolder
+# api = HfApi(token=os.environ["HF_ACCESS_TOKEN"])
 #
-#api.upload_folder(
+# api.upload_folder(
 #    folder_path="./data/data",
 #    repo_id="nnethercott/Recap-DataComp-200K",
 #    repo_type="dataset",
 #    multi_commits=True,
 #    multi_commits_verbose=True,
-#)
-
+# )

@@ -1,13 +1,13 @@
 import datasets
-import torch 
+import torch
 from torch.utils.data import Dataset, DataLoader
 import os
 from typing import Callable
 import functools
-import random 
-from tqdm import tqdm 
+import random
+from tqdm import tqdm
 
-from concurrent.futures import ThreadPoolExecutor 
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from PIL import Image
 import io
@@ -22,71 +22,83 @@ IDEA:
         * can adjust batch size dynamically for us
 """
 
+
 # torch.utils.data.Dataset subclass
 class CustomDataset(Dataset):
     def __init__(self, data):
-        #TODO: sorted(data, key=lambda x: len(x['input_ids'])) 
+        # TODO: sorted(data, key=lambda x: len(x['input_ids']))
         if torch.distributed.is_initialized():
             rank = int(os.environ["LOCAL_RANK"])
             world_size = int(os.environ["WORLD_SIZE"])
-            block_size = len(data)//world_size
-            self.data = data[rank*block_size:(rank+1)*block_size] #drop len(data)%block_size samples
+            block_size = len(data) // world_size
+            self.data = data[
+                rank * block_size : (rank + 1) * block_size
+            ]  # drop len(data)%block_size samples
         else:
             self.data = data
 
     def __len__(self):
         return len(self.data)
+
     def __getitem__(self, i):
         return self.data[i]
 
 
-# TODO: use this to download images instead of dynamic get  
+# TODO: use this to download images instead of dynamic get
 class CustomDatasetForImages(CustomDataset):
-    def __init__(self, data, cache=True, request_timeout: float = 3.):
-            super().__init__(data)
-            self.offset = 0
-            self.cache = cache
-            self.timeout = request_timeout
+    def __init__(self, data, cache=True, request_timeout: float = 3.0):
+        super().__init__(data)
+        self.offset = 0
+        self.cache = cache
+        self.timeout = request_timeout
 
-            self.build() 
-            self.trim()
+        self.build()
+        self.trim()
 
     def get_image(self, url):
         try:
-            return Image.open(io.BytesIO(requests.get(url, timeout=self.timeout).content)).convert('RGB')
+            return Image.open(
+                io.BytesIO(requests.get(url, timeout=self.timeout).content)
+            ).convert("RGB")
         except:
             raise RuntimeError(f"image: {url} could not be downloaded !")
 
-    #@override
+    # @override
     def __getitem__(self, i):
         if self.cache:
-            return self.data[i] 
-        
+            return self.data[i]
+
         img = self.get_image(i)
-        return {**self.data[i], 'images': img}
-        
+        return {**self.data[i], "images": img}
 
     def build(self):
-        urls_enumed = [(e,d['url']) for e,d in enumerate(self.data)]
+        urls_enumed = [(e, d["url"]) for e, d in enumerate(self.data)]
 
         def download(idx, url):
             try:
                 img = self.get_image(url)
-                if not len(img.size)==2 or img.size[:2] <= (1,1):  # edge cases
+                if not len(img.size) == 2 or img.size[:2] <= (1, 1):  # edge cases
                     return (idx, None)
 
                 if self.cache:
-                    self.data[idx] = {**self.data[idx], 'images': img}
+                    self.data[idx] = {**self.data[idx], "images": img}
                 return (idx, img)
             except:
                 return (idx, None)
 
-        with ThreadPoolExecutor(max_workers = int(os.environ.get("OMP_NUM_THREADS", 16))) as executor:
-            res = list(tqdm(executor.map(lambda args: download(*args), urls_enumed), total=len(urls_enumed)))
+        with ThreadPoolExecutor(
+            max_workers=int(os.environ.get("OMP_NUM_THREADS", 16))
+        ) as executor:
+            res = list(
+                tqdm(
+                    executor.map(lambda args: download(*args), urls_enumed),
+                    total=len(urls_enumed),
+                )
+            )
 
-        # remove bad ids from data 
-        # nice leet code stuff 
-        bad_ids = [p[0] for p in res if p[1] is None]        
+        # remove bad ids from data
+        # nice leet code stuff
+        bad_ids = [p[0] for p in res if p[1] is None]
         bad_ids = sorted(bad_ids)[::-1]
         for idx in bad_ids:
             self.data.pop(idx)
@@ -95,11 +107,11 @@ class CustomDatasetForImages(CustomDataset):
 
     def trim(self):
         if torch.distributed.is_initialized():
-            # broadcast self.data lengths and choose min 
+            # broadcast self.data lengths and choose min
             pass
 
 
-# no build at init 
+# no build at init
 class LazyCustomDatasetForImages(CustomDatasetForImages):
     def __init__(self, data, request_timeout: float = 3):
         CustomDataset.__init__(self, data)
@@ -107,12 +119,12 @@ class LazyCustomDatasetForImages(CustomDatasetForImages):
 
     def __getitem__(self, idx):
         try:
-            img = self.get_image(self.data[idx]['url'])
-            if len(img.size)>2 or img.size[:2]==(1,1):
+            img = self.get_image(self.data[idx]["url"])
+            if len(img.size) > 2 or img.size[:2] == (1, 1):
                 img = None
         except:
             img = None
-        return {**self.data[idx], 'images': img}
+        return {**self.data[idx], "images": img}
 
 
 # can use this for diverse batch sizes in normal dataset ordered by context length too
@@ -121,15 +133,16 @@ class MultiDataLoader:
     """
     random sample between several dataloaders, allowing for multimodality training
     """
+
     def __init__(self, *loaders, **kwargs):
         self.loaders = list(loaders)
-        self.loader_iters = [iter(loader) for loader in self.loaders]  
-        self.loader_lens = [len(loader) for loader in self.loaders]  
-        self.buffer = list(range(len(self.loaders)))  
-        self.weights =  [l/sum(self.loader_lens) for l in self.loader_lens]
+        self.loader_iters = [iter(loader) for loader in self.loaders]
+        self.loader_lens = [len(loader) for loader in self.loaders]
+        self.buffer = list(range(len(self.loaders)))
+        self.weights = [l / sum(self.loader_lens) for l in self.loader_lens]
 
-        # hacky 
-        seed = kwargs.get('seed', None)
+        # hacky
+        seed = kwargs.get("seed", None)
         if seed:
             self.sampler = random.Random(seed)
         else:
@@ -146,13 +159,13 @@ class MultiDataLoader:
             raise StopIteration
 
         if self.sampler is not None:
-            idx = self.sampler.choices(self.buffer, weights = self.weights, k=1)[0]
+            idx = self.sampler.choices(self.buffer, weights=self.weights, k=1)[0]
         else:
             idx = random.choices(self.buffer, weights=self.weights, k=1)[0]
 
         try:
             batch = next(self.loader_iters[idx])
-            self.loader_lens[idx] -= 1  
+            self.loader_lens[idx] -= 1
 
             if self.loader_lens[idx] == 0:
                 # remove data loader
@@ -161,8 +174,8 @@ class MultiDataLoader:
                 self.loader_lens.pop(idx)
                 self.weights.pop(idx)
 
-                # fix buffer indices 
-                self.buffer = list(range(len(self.loader_iters)))  
+                # fix buffer indices
+                self.buffer = list(range(len(self.loader_iters)))
 
             return batch
 
@@ -176,8 +189,11 @@ def sft_collate_fn(inputs, tok):
     """
     dynamically pads input tensors and constructs attn mask
     """
+    # print(inputs)
     # remove samples which we couldn't download image for
-    bad_ids = [i for i, sample in enumerate(inputs) if sample.get('images', True) is None]
+    bad_ids = [
+        i for i, sample in enumerate(inputs) if sample.get("images", True) is None
+    ]
     bad_ids = bad_ids[::-1]
     for i in bad_ids:
         inputs.pop(i)
@@ -205,82 +221,84 @@ def sft_collate_fn(inputs, tok):
     seq_end = (
         torch.tensor([len(i) for i in input_ids]).unsqueeze(1).repeat((1, max_len))
     )
-    prompt_end = (
-        torch.tensor(prompt_len).unsqueeze(1).repeat((1, max_len))
-    )
-    attn_mask = (pos < seq_end)
-
+    prompt_end = torch.tensor(prompt_len).unsqueeze(1).repeat((1, max_len))
+    attn_mask = pos < seq_end
 
     # TODO: zero out loss on prompt tokens for labels
     labels_t = input_ids_t.clone()
     labels_t.masked_fill_(attn_mask == 0, -100)
 
-    if prompt_len != [0]*len(prompt_len):
-        labels_t.masked_fill_(pos<prompt_end, -100) 
+    if prompt_len != [0] * len(prompt_len):
+        labels_t.masked_fill_(pos < prompt_end, -100)
 
     return {
         "input_ids": input_ids_t,
         "attention_mask": attn_mask.to(torch.long),
         "labels": labels_t,
         "images": inputs.get("images", None),
-        "url": inputs.get("url"), #debug
+        "url": inputs.get("url"),  # debug
     }
 
 
 def apply_chat_template(
-        data: datasets.Dataset, 
-        tok, 
-        ctx_len: int = 384,
-        truncate: bool = False,
-        prompt_template = None,
-        response_template = None,
+    data: datasets.Dataset,
+    tok,
+    ctx_len: int = 384,
+    truncate: bool = False,
+    instruction_template=None,
+    response_template=None,
 ):
     """
     Arguments:
         - data: lazy dataset loaded with `streaming=True`. dataset should have column 'response'. if no 'prompt' present we use ''
         - tok: tokenizer
-        - template: optional syntaxing 
+        - template: optional syntaxing
         - n: how many samples to load
         - preprocess: optional preprocessing mapped before the boilerplate
         - ctx_len: max length for input ids
         - trim: if true we truncate samples exceeding max length, else we filter them out
-    
+
     features:
         - adds EOS token to the end of each text entry -> formats like SOS+encoded+EOS
-            - ensures free lunch with pure-text datasets, image ones handled by vlm 
+            - ensures free lunch with pure-text datasets, image ones handled by vlm
     """
-    if prompt_template is None:
-        prompt_template = tok.bos_token + "{prompt}" + tok.eos_token # <s>prompt</s>
+    if instruction_template is None:
+        instruction_template = (
+            tok.bos_token + "{prompt}" + tok.eos_token
+        )  # <s>prompt</s>
     if response_template is None:
         response_template = "{response}" + tok.eos_token
 
-
     def process(samples):
-        prompts = [prompt_template.format(prompt=p) for p in samples['prompt']] 
-        responses = [response_template.format(response=r) for r in samples['response']]
-        inputs = [p + r for p,r in zip(prompts,responses)]
+        prompts = [instruction_template.format(prompt=p) for p in samples["prompt"]]
+        responses = [response_template.format(response=r) for r in samples["response"]]
+        inputs = [p + r for p, r in zip(prompts, responses)]
 
-        prompt_len = [len(tok.encode(p, add_special_tokens=False)) for p in prompts] 
+        prompt_len = [len(tok.encode(p, add_special_tokens=False)) for p in prompts]
 
         if truncate:
-            input_ids = [tok.encode(i, add_special_tokens=False)[:ctx_len] for i in inputs]
+            input_ids = [
+                tok.encode(i, add_special_tokens=False)[:ctx_len] for i in inputs
+            ]
         else:
             input_ids = [tok.encode(i, add_special_tokens=False) for i in inputs]
 
-        samples['input_ids'] = input_ids
-        samples['prompt_len'] = prompt_len
+        samples["input_ids"] = input_ids
+        samples["prompt_len"] = prompt_len
 
         return samples
-        
-    # map 
-    data = data.map(process, batched=True,)
+
+    # map
+    data = data.map(
+        process,
+        batched=True,
+    )
 
     # filter
     if not truncate:
-        data = data.filter(lambda x: [len(y) <= ctx_len for y in x["input_ids"]], batched=True)
+        data = data.filter(
+            lambda x: [len(y) <= ctx_len for y in x["input_ids"]], batched=True
+        )
 
     # loadable in torch dataloader
     return data
-
-
-

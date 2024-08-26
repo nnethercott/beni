@@ -2,7 +2,7 @@
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
 import inspect
-from dataclasses import fields, asdict 
+from dataclasses import fields, asdict
 from peft import (
     LoraConfig,
     AdaptionPromptConfig,
@@ -31,14 +31,16 @@ def update_config(config, **kwargs):
                         print(f"Warning: {config_name} does not accept parameter: {k}")
             elif isinstance(config, train_config):
                 print(f"Warning: unknown parameter {k}")
-                        
-                        
+
+
 def generate_peft_config(train_config, kwargs):
     configs = (lora_config, llama_adapter_config, prefix_config)
     peft_configs = (LoraConfig, AdaptionPromptConfig, PrefixTuningConfig)
     names = tuple(c.__name__.rstrip("_config") for c in configs)
 
-    assert train_config.peft_method in names, f"Peft config not found: {train_config.peft_method}"
+    assert (
+        train_config.peft_method in names
+    ), f"Peft config not found: {train_config.peft_method}"
 
     config = configs[names.index(train_config.peft_method)]()
 
@@ -47,4 +49,3 @@ def generate_peft_config(train_config, kwargs):
     peft_config = peft_configs[names.index(train_config.peft_method)](**params)
 
     return peft_config
-

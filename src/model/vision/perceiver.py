@@ -34,7 +34,10 @@ from transformers.utils import (
     logging,
 )
 from transformers import AutoModel
-from transformers.models.idefics2.configuration_idefics2 import Idefics2Config, Idefics2VisionConfig
+from transformers.models.idefics2.configuration_idefics2 import (
+    Idefics2Config,
+    Idefics2VisionConfig,
+)
 
 
 if is_flash_attn_2_available():
@@ -42,26 +45,27 @@ if is_flash_attn_2_available():
 
 
 from transformers import PretrainedConfig
-class PerceiverResamplerConfig(PretrainedConfig):
 
+
+class PerceiverResamplerConfig(PretrainedConfig):
     def __init__(
-        self, 
+        self,
         hidden_size: int,
         rms_norm_eps: float = 1e-06,
         n_latents: int = 64,
         hidden_act: str = "silu",
         depth: int = 1,
-        n_heads: int = 32, 
+        n_heads: int = 32,
         head_dim: int = 96,
         n_query_groups: int = 1,
         concat_latents_kv: bool = False,
         attention_dropout: float = 0.0,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
-        self.rms_norm_eps = rms_norm_eps 
-        self.n_latents=n_latents
+        self.rms_norm_eps = rms_norm_eps
+        self.n_latents = n_latents
         self.hidden_size = hidden_size
         self.hidden_act = hidden_act
         self.depth = depth
@@ -72,9 +76,9 @@ class PerceiverResamplerConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
 
 
-#@dataclass
-#class PerceiverResamplerConfig:
-#    hidden_size: int 
+# @dataclass
+# class PerceiverResamplerConfig:
+#    hidden_size: int
 #    rms_norm_eps: float = 1e-06
 #    n_latents: int = 64
 #    hidden_act: str = "silu"
@@ -102,7 +106,6 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Idefics2
@@ -139,10 +142,18 @@ class PerceiverAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.concat_latents_kv = config.concat_latents_kv
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_query_groups * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_query_groups * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_query_groups * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_query_groups * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
 
         self.is_causal = False
 
@@ -172,19 +183,22 @@ class PerceiverAttention(nn.Module):
         kv_seq_len = context.size()[1]
 
         if self.concat_latents_kv:
-            kv_seq_len += q_len 
+            kv_seq_len += q_len
             hidden_states = torch.concat([context, latents], dim=-2)
         else:
-            hidden_states= context
+            hidden_states = context
 
         q = self.q_proj(latents)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
         q = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, kv_seq_len, self.num_query_groups, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, kv_seq_len, self.num_query_groups, self.head_dim).transpose(1, 2)
-
+        k = k.view(bsz, kv_seq_len, self.num_query_groups, self.head_dim).transpose(
+            1, 2
+        )
+        v = v.view(bsz, kv_seq_len, self.num_query_groups, self.head_dim).transpose(
+            1, 2
+        )
 
         past_key_value = getattr(self, "past_key_value", past_key_value)
 
@@ -193,8 +207,8 @@ class PerceiverAttention(nn.Module):
 
         # repeat k,v enough times so we can shove into F.scaled_dot_product_attention
         if q.shape != k.shape:
-            k = k.repeat_interleave(q.shape[1]//k.shape[1], dim=1)
-            v = v.repeat_interleave(q.shape[1]//v.shape[1], dim=1)
+            k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+            v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
 
         attn_weights = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
 
@@ -213,7 +227,9 @@ class PerceiverAttention(nn.Module):
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(q.dtype)
         attn_output = torch.matmul(attn_weights, v)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -270,8 +286,12 @@ class PerceiverFlashAttention(PerceiverAttention):
         v = self.v_proj(torch.cat([context, latents], dim=-2))
 
         q = q.view(bsz, q_len, self.num_heads, self.head_dim)
-        k = k.view(bsz, kv_seq_len, self.num_query_groups, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, kv_seq_len, self.num_query_groups, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, kv_seq_len, self.num_query_groups, self.head_dim).transpose(
+            1, 2
+        )
+        v = v.view(bsz, kv_seq_len, self.num_query_groups, self.head_dim).transpose(
+            1, 2
+        )
 
         kv_seq_len = k.shape[-2]
         if past_key_value is not None:
@@ -279,7 +299,10 @@ class PerceiverFlashAttention(PerceiverAttention):
 
         if past_key_value is not None:
             # Activate slicing cache only if the config has a value `sliding_windows` attribute
-            if hasattr(self.config, "sliding_window") and kv_seq_len > self.config.sliding_window:
+            if (
+                hasattr(self.config, "sliding_window")
+                and kv_seq_len > self.config.sliding_window
+            ):
                 slicing_tokens = kv_seq_len - self.config.sliding_window
 
                 past_key = past_key_value[0]
@@ -298,7 +321,10 @@ class PerceiverFlashAttention(PerceiverAttention):
 
                 if attention_mask is not None:
                     attention_mask = attention_mask[:, slicing_tokens:]
-                    attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
+                    attention_mask = torch.cat(
+                        [attention_mask, torch.ones_like(attention_mask[:, -1:])],
+                        dim=-1,
+                    )
 
             k = torch.cat([past_key_value[0], k], dim=2)
             v = torch.cat([past_key_value[1], v], dim=2)
@@ -349,7 +375,9 @@ class PerceiverFlashAttention(PerceiverAttention):
             use_top_left_mask=self._flash_attn_uses_top_left_mask,
         )
 
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()
+        attn_output = attn_output.reshape(
+            bsz, q_len, self.num_heads * self.head_dim
+        ).contiguous()
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -374,7 +402,9 @@ class PerceiverLayer(nn.Module):
 
         self.input_latents_norm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.input_context_norm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
-        self.self_attn = IDEFICS2_PERCEIVER_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx=layer_idx)
+        self.self_attn = IDEFICS2_PERCEIVER_ATTENTION_CLASSES[
+            config._attn_implementation
+        ](config, layer_idx=layer_idx)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.mlp = MLP(
             hidden_size=config.hidden_size,
@@ -393,7 +423,9 @@ class PerceiverLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> Tuple[
+        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
+    ]:
         """
         Args:
             latents (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -450,13 +482,15 @@ class PerceiverResampler(nn.Module):
         self.n_latents = config.n_latents
         self.depth = config.depth
         self.rms_norm_eps = config.rms_norm_eps
-        self.concat_latents_kv = config.concat_latents_kv 
+        self.concat_latents_kv = config.concat_latents_kv
 
         # Create Latents for Perceiver
         self.latents = nn.Parameter(torch.ones(self.n_latents, self.hidden_size))
 
         # Create Transformer Blocks
-        self.layers = nn.ModuleList([PerceiverLayer(config, idx) for idx in range(self.depth)])
+        self.layers = nn.ModuleList(
+            [PerceiverLayer(config, idx) for idx in range(self.depth)]
+        )
         self.norm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
 
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
@@ -467,16 +501,22 @@ class PerceiverResampler(nn.Module):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         # seq embed -> bsz seq embed
-        latents = self.latents.unsqueeze(0).expand((context.shape[0], *self.latents.size()))
+        latents = self.latents.unsqueeze(0).expand(
+            (context.shape[0], *self.latents.size())
+        )
 
         if self.concat_latents_kv:
             latent_attention_mask = torch.ones(
-                (attention_mask.size(0), latents.size(1)), dtype=attention_mask.dtype, device=attention_mask.device
+                (attention_mask.size(0), latents.size(1)),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
             )
             attention_mask = torch.cat([attention_mask, latent_attention_mask], dim=-1)
 
         attention_mask = (
-            _prepare_4d_attention_mask(attention_mask, latents.dtype, tgt_len=self.n_latents)
+            _prepare_4d_attention_mask(
+                attention_mask, latents.dtype, tgt_len=self.n_latents
+            )
             if not self._use_flash_attention_2
             else attention_mask
         )
@@ -499,17 +539,17 @@ class PerceiverResampler(nn.Module):
 
         return compressed_context
 
+
 if __name__ == "__main__":
     from ..beni import BeniConfig
 
-    c = PerceiverResamplerConfig(hidden_size = 512, depth = 3, n_latents = 32)
+    c = PerceiverResamplerConfig(hidden_size=512, depth=3, n_latents=32)
     p = PerceiverResampler(c)
 
     print(p)
-    print(sum((i.numel() for i in p.parameters()))/1e9)
+    print(sum((i.numel() for i in p.parameters())) / 1e9)
 
     samples = torch.rand(6, 384, 512)
-    a = [[1]*384 for _ in range(6)]
-    out = p(samples,a)
+    a = [[1] * 384 for _ in range(6)]
+    out = p(samples, a)
     print(out.shape)
-

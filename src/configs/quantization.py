@@ -6,12 +6,17 @@ from typing import Optional
 import torch
 from transformers import BitsAndBytesConfig
 
+
 @dataclass
 class quantization_config:
-    quant_type: str =  "nf4" # "fp4" or "nf4"
-    compute_dtype: torch.dtype = torch.float16 if torch.cuda.get_device_capability(0)[0] <8 else torch.bfloat16
+    quant_type: str = "nf4"  # "fp4" or "nf4"
+    compute_dtype: torch.dtype = (
+        torch.float16 if torch.cuda.get_device_capability(0)[0] < 8 else torch.bfloat16
+    )
     use_double_quant: bool = False
-    quant_storage: torch.dtype = torch.float16 if torch.cuda.get_device_capability(0)[0] <8 else torch.bfloat16
+    quant_storage: torch.dtype = (
+        torch.float16 if torch.cuda.get_device_capability(0)[0] < 8 else torch.bfloat16
+    )
 
     def create_bnb_config(self, quantization: str) -> BitsAndBytesConfig:
         if quantization not in {"4bit", "8bit"}:
@@ -24,7 +29,7 @@ class quantization_config:
                 "bnb_4bit_use_double_quant": self.use_double_quant,
                 "bnb_4bit_quant_storage": self.quant_storage,
             }
-            
+
             return BitsAndBytesConfig(load_in_4bit=True, **config_params)
         else:
             return BitsAndBytesConfig(load_in_8bit=True)

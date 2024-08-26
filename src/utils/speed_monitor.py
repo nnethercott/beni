@@ -6,7 +6,9 @@ from typing import Any, Callable, Deque, Dict, Optional
 import torch
 from lightning import Callback, Fabric, LightningModule, Trainer
 from lightning.fabric.utilities.rank_zero import rank_zero_only as fabric_rank_zero_only
-from lightning.pytorch.utilities.rank_zero import rank_zero_only as trainer_rank_zero_only
+from lightning.pytorch.utilities.rank_zero import (
+    rank_zero_only as trainer_rank_zero_only,
+)
 from torch.utils.flop_counter import FlopCounterMode
 import math
 from lit_gpt import GPT, Config
@@ -46,14 +48,41 @@ GPU_AVAILABLE_FLOPS = {
         "bf16-mixed": 312e12,
     },
     # source: https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a10/pdf/a10-datasheet.pdf
-    "a10g": {"32-true": 31.2e12, "16-true": 125e12, "16-mixed": 125e12, "bf16-true": 125e12, "bf16-mixed": 125e12},
+    "a10g": {
+        "32-true": 31.2e12,
+        "16-true": 125e12,
+        "16-mixed": 125e12,
+        "bf16-true": 125e12,
+        "bf16-mixed": 125e12,
+    },
     # source: https://images.nvidia.com/content/technologies/volta/pdf/volta-v100-datasheet-update-us-1165301-r5.pdf
-    "v100-sxm": {"64-true": 7.8e12, "32-true": 15.7e12, "16-true": 125e12, "16-mixed": 125e12},
-    "v100-pcie": {"64-true": 7e12, "32-true": 14e12, "16-true": 112e12, "16-mixed": 112e12},
-    "v100s-pcie": {"64-true": 8.2e12, "32-true": 16.4e12, "16-true": 130e12, "16-mixed": 130e12},
+    "v100-sxm": {
+        "64-true": 7.8e12,
+        "32-true": 15.7e12,
+        "16-true": 125e12,
+        "16-mixed": 125e12,
+    },
+    "v100-pcie": {
+        "64-true": 7e12,
+        "32-true": 14e12,
+        "16-true": 112e12,
+        "16-mixed": 112e12,
+    },
+    "v100s-pcie": {
+        "64-true": 8.2e12,
+        "32-true": 16.4e12,
+        "16-true": 130e12,
+        "16-mixed": 130e12,
+    },
     # source: https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet-951643.pdf
     # sxm and pcie have same flop counts
-    "t4": {"32-true": 8.1e12, "16-true": 65e12, "16-mixed": 65e12, "8-true": 130e12, "int4": 260e12},
+    "t4": {
+        "32-true": 8.1e12,
+        "16-true": 65e12,
+        "16-mixed": 65e12,
+        "8-true": 130e12,
+        "int4": 260e12,
+    },
     # https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/quadro-product-literature/quadro-rtx-5000-data-sheet-us-nvidia-704120-r4-web.pdf
     "quadro rtx 5000": {"32-true": 11.2e12, "16-true": 89.2e12, "16-mixed": 89.2e12},
 }
@@ -76,7 +105,9 @@ def get_flops_available(device: torch.device, precision: str) -> Optional[float]
         device_name = torch.cuda.get_device_name(device).lower()
         if "h100" in device_name and "hbm3" in device_name:
             device_name = "h100-sxm"
-        elif "h100" in device_name and ("pcie" in device_name or "hbm2e" in device_name):
+        elif "h100" in device_name and (
+            "pcie" in device_name or "hbm2e" in device_name
+        ):
             device_name = "h100-pcie"
         elif "a100" in device_name:
             device_name = "a100"
@@ -244,28 +275,35 @@ class SpeedMonitorBase:
             dev_samples_per_sec = elapsed_samples / elapsed_wct
             metrics.update(
                 {
-                    "throughput/batches_per_sec": elapsed_batches * world_size / elapsed_wct,
+                    "throughput/batches_per_sec": elapsed_batches
+                    * world_size
+                    / elapsed_wct,
                     "throughput/samples_per_sec": samples_per_sec,
                     "throughput/device/batches_per_sec": elapsed_batches / elapsed_wct,
                     "throughput/device/samples_per_sec": dev_samples_per_sec,
                 }
             )
             if lengths is not None:
-                elapsed_lengths = int(self.history_lengths[-1]) - int(self.history_lengths[0])
-                avg_length = elapsed_lengths / elapsed_batches  
+                elapsed_lengths = int(self.history_lengths[-1]) - int(
+                    self.history_lengths[0]
+                )
+                avg_length = elapsed_lengths / elapsed_batches
                 metrics.update(
                     {
                         "throughput/tokens_per_sec": samples_per_sec * avg_length,
-                        "throughput/device/tokens_per_sec": dev_samples_per_sec * avg_length,
+                        "throughput/device/tokens_per_sec": dev_samples_per_sec
+                        * avg_length,
                         "total_tokens": avg_length * world_size * samples,
                     }
                 )
                 if train_loss is not None:
-                    avg_loss = sum(self.history_training_loss) / len(self.history_training_loss)
+                    avg_loss = sum(self.history_training_loss) / len(
+                        self.history_training_loss
+                    )
                     metrics.update(
                         {
                             "metric/train_loss": avg_loss,
-                            "metric/train_ppl": math.exp(avg_loss)
+                            "metric/train_ppl": math.exp(avg_loss),
                         }
                     )
 
@@ -278,10 +316,15 @@ class SpeedMonitorBase:
             flops_per_sec = elapsed_flops / elapsed_wct
             device_flops_per_sec = flops_per_sec / world_size
             metrics.update(
-                {"throughput/flops_per_sec": flops_per_sec, "throughput/device/flops_per_sec": device_flops_per_sec}
+                {
+                    "throughput/flops_per_sec": flops_per_sec,
+                    "throughput/device/flops_per_sec": device_flops_per_sec,
+                }
             )
             if self.flops_available:
-                metrics["throughput/device/mfu"] = device_flops_per_sec / self.flops_available
+                metrics["throughput/device/mfu"] = (
+                    device_flops_per_sec / self.flops_available
+                )
 
         metrics.update(
             {
@@ -301,7 +344,9 @@ class SpeedMonitorBase:
 class SpeedMonitorFabric(SpeedMonitorBase):
     def __init__(self, fabric: Fabric, *args: Any, **kwargs: Any) -> None:
         # TODO: this will not work properly if a precision plugin is passed to Fabric
-        flops_available = get_flops_available(fabric.device, fabric._connector._precision_input)
+        flops_available = get_flops_available(
+            fabric.device, fabric._connector._precision_input
+        )
         super().__init__(flops_available, fabric.log_dict, *args, **kwargs)
 
     @fabric_rank_zero_only
@@ -310,7 +355,9 @@ class SpeedMonitorFabric(SpeedMonitorBase):
 
 
 class SpeedMonitorCallback(Callback):
-    def __init__(self, length_fn: Callable[[Any], int], batch_size: int, **kwargs: Any) -> None:
+    def __init__(
+        self, length_fn: Callable[[Any], int], batch_size: int, **kwargs: Any
+    ) -> None:
         super().__init__()
         self.speed_monitor: Optional[SpeedMonitorBase] = None
         self.speed_monitor_kwargs = kwargs
@@ -327,7 +374,9 @@ class SpeedMonitorCallback(Callback):
         flops_available = get_flops_available(
             trainer.strategy.root_device, trainer._accelerator_connector._precision_flag
         )
-        self.speed_monitor = SpeedMonitorBase(flops_available, trainer.logger.log_metrics, **self.speed_monitor_kwargs)
+        self.speed_monitor = SpeedMonitorBase(
+            flops_available, trainer.logger.log_metrics, **self.speed_monitor_kwargs
+        )
 
     @trainer_rank_zero_only
     def on_train_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
@@ -338,7 +387,12 @@ class SpeedMonitorCallback(Callback):
 
     @trainer_rank_zero_only
     def on_train_batch_end(
-        self, trainer: Trainer, pl_module: LightningModule, outputs: Any, batch: Any, batch_idx: int
+        self,
+        trainer: Trainer,
+        pl_module: LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
     ) -> None:
         self.total_lengths += self.length_fn(batch)
         if trainer.fit_loop._should_accumulate():
@@ -368,11 +422,15 @@ class SpeedMonitorCallback(Callback):
 
 
 def flops_per_param(config: Config, n_params: int) -> int:
-    flops_per_token = 2 * n_params  # each parameter is used for a MAC (2 FLOPS) per network operation
+    flops_per_token = (
+        2 * n_params
+    )  # each parameter is used for a MAC (2 FLOPS) per network operation
     # this assumes that all samples have a fixed length equal to the block size
     # which is most likely false during finetuning
     flops_per_seq = flops_per_token * config.block_size
-    attn_flops_per_seq = config.n_layer * 2 * 2 * (config.n_embd * (config.block_size**2))
+    attn_flops_per_seq = (
+        config.n_layer * 2 * 2 * (config.n_embd * (config.block_size**2))
+    )
     return flops_per_seq + attn_flops_per_seq
 
 

@@ -46,20 +46,25 @@ class FlopMeasure(FlopCounterMode):
             self.start_time = time.time()
         elif self.warmup_step == -1 and self.start_time != 0 and self.end_time == 0:
             self.end_time = time.time()
+
     def __enter__(self):
         if self.warmup_step == 0:
             self.start_time = time.time()
         super().__enter__()
         return self
+
     def is_done(self):
         return self.warmup_step == -1
+
     def get_total_flops(self):
         return super().get_total_flops()
+
     def get_flops_per_sec(self):
         if self.start_time == 0 or self.end_time == 0:
             print("Warning: flop count did not finish correctly")
             return 0
-        return super().get_total_flops()/ (self.end_time - self.start_time)
+        return super().get_total_flops() / (self.end_time - self.start_time)
+
     def get_table(self, depth=2):
         return super().get_table(depth)
 
@@ -71,8 +76,16 @@ class FlopMeasure(FlopCounterMode):
         else:
             if self.display:
                 if self.rank is None or self.rank == 0:
-                    print("Total time used in this flop counting step is: {}".format(self.end_time - self.start_time))
-                    print("The total TFlop per second is: {}".format(self.get_flops_per_sec() / 1e12))
+                    print(
+                        "Total time used in this flop counting step is: {}".format(
+                            self.end_time - self.start_time
+                        )
+                    )
+                    print(
+                        "The total TFlop per second is: {}".format(
+                            self.get_flops_per_sec() / 1e12
+                        )
+                    )
                     print("The tflop_count table is below:")
                     print(self.get_table(self.depth))
             # Disable the display feature so that we don't print the table again
