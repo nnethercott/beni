@@ -21,7 +21,7 @@ from transformers import (
     LlamaConfig,
     AutoTokenizer,
 )
-from peft import PeftModel
+from peft import PeftModel, PeftConfig, get_peft_model
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
@@ -132,6 +132,8 @@ class BeniConfig:
     response_template: str = None
     llm_quantization_config: Optional[Any] = None
 
+    def to_dict(self):
+        return asdict(self)
 
 class Beni(nn.Module):
     """
@@ -139,7 +141,7 @@ class Beni(nn.Module):
         * allow for prompt templates
     """
 
-    def __init__(self, config: BeniConfig, hf_token: None):
+    def __init__(self, config: BeniConfig, hf_token = None):
         super().__init__()
         self.config = config
         self.token = hf_token
@@ -152,6 +154,7 @@ class Beni(nn.Module):
 
         if self.config.freeze:
             self.freeze()
+        
 
     def build_vision_and_text(self, config):
         vision_cls = getattr(transformers, config.vision_cls, "AutoModel")
@@ -344,13 +347,13 @@ class Beni(nn.Module):
             input_ids is not None or images is not None
         ), "You can't forward without text and/or images!"
 
-        # print(self.tokenizer.batch_decode(input_ids))
+        #print(self.tokenizer.batch_decode(input_ids))
         input_ids, attention_mask, inputs_embeds, labels = self.prepare_inputs(
             input_ids, attention_mask, inputs_embeds, labels, images
         )
 
         # print(attention_mask)
-        # print(self.tokenizer.batch_decode(labels.masked_fill(labels==-100, self.tokenizer.encode('X', add_special_tokens=False)[0])))
+        #print(self.tokenizer.batch_decode(labels.masked_fill(labels==-100, self.tokenizer.encode('X', add_special_tokens=False)[0])))
 
         return self.llm(
             input_ids=input_ids,

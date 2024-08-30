@@ -36,7 +36,7 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.clip.modeling_clip import CLIPEncoderLayer
 from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
 
-from peft import LoraConfig, get_peft_model, PeftModel
+from peft import LoraConfig, PeftModel, get_peft_model
 
 # local
 from model.vision import *
@@ -80,27 +80,11 @@ def fsdp_main(model_config, **kwargs):
     fsdp_config = kwargs["fsdp_config"]
     lora_config = kwargs.get("lora_config", None)
 
-    # TODO: run a pip freeze on the venv and upload that too
-    """
-    try: 
-        from pip._internal.operations import freeze
-    except ImportError: # pip < 10.0
-        from pip.operations import freeze
-
-    pkgs = freeze.freeze() # add this to config dict
-    """
     rank = int(os.getenv("LOCAL_RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     seed_everything(rank)
 
     model_config_copy = copy.deepcopy(asdict(model_config))
-
-    # save environment
-    if rank == 0:
-        os.system("pipreqs ../")
-        with open("../requirements.txt", "r") as f:
-            pip_env = f.read().splitlines()
-        model_config_copy["pip_env"] = pip_env
 
     configs = {
         "model_config": model_config_copy,
@@ -108,6 +92,13 @@ def fsdp_main(model_config, **kwargs):
         "fsdp_config": fsdp_config,
         "lora_config": lora_config,
     }
+
+    # save environment
+    if rank == 0:
+        os.system("pipreqs ../")
+        with open("../requirements.txt", "r") as f:
+            configs['pip_env'] = f.read().splitlines()
+
     wandb_run = wandb_config.build_run(configs, rank == 0)
 
     # setup each cuda device ('device' aliased to cuda:n)
@@ -195,14 +186,14 @@ def fsdp_main(model_config, **kwargs):
     response_template = model.config.response_template
     dsr = load_recap(
         model.tokenizer,
-        n=10000,
+        n=50000,
         skip=0,
         instruction_template=instruction_template,
         response_template=response_template,
     )
     dsl = load_allava_laion(
         model.tokenizer,
-        n=10000,
+        n=50000,
         instruction_template=instruction_template,
         response_template=response_template,
     )
@@ -360,7 +351,6 @@ if __name__ == "__main__":
         perceiver_config=None,
         vision_name_or_path="google/siglip-so400m-patch14-384",
         text_name_or_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        # text_name_or_path = "google/gemma-2-2b-it",
         vision_cls="SiglipVisionModel",
         vision_processor_cls="SiglipImageProcessor",
         freeze=True,
@@ -370,9 +360,9 @@ if __name__ == "__main__":
         feature_select_index=-1,
         use_cls=True,
         sparsity_plugins=None,
-        # bos_token="<bos><start_of_turn>",
-        # instruction_template="<bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n",  # all tokens we want no loss on
-        # response_template="{response}<end_of_turn><eos>",
+        bos_token="<s><|user|>",
+        instruction_template="<s><|user|>\n{instruction}</s>\n<|assistant|>\n",  # all tokens we want no loss on
+        response_template="{response}</s>",
         # llm_quantization_config = BitsAndBytesConfig(
         #    load_in_4bit = True,
         #    bnb_4bit_compute_dtype=torch.float16,
@@ -383,19 +373,19 @@ if __name__ == "__main__":
 
     train_config = TrainConfig(
         warmup_ratio=0.03,
-        batch_size=4,
-        gradient_accumulation_steps=4,
+        batch_size=7,
+        gradient_accumulation_steps=3,
         lr=4e-04,
         weight_decay=0.0,
         min_lr=4e-05,
         grad_clip=1.0,
-        save_steps=500,
+        save_steps=125,
         log_steps=1,
         ckpt_path=None,
-        save_path="../model_checkpoints/nate-test-dump",
-        betas=[0.9, 0.999],
+        save_path="/mnt/nate/beni/vincent_demo",
+        betas=[0.9, 0.95],
         fsdp=True,
-        enable_peft=False,
+        enable_peft=True,
     )
 
     # need this for weight tying: torch.nn.Embedding, # if we upscale images we can't fsdp the positional embeddings ?
@@ -418,8 +408,8 @@ if __name__ == "__main__":
         + "-"
         + str(uuid.uuid1()).split("-")[-1],  # model-archi-uuid
     )
-    # lora_config = LoraConfig(r=8, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none')
-    lora_config = None
+    lora_config = LoraConfig(r=4, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none')
+    #lora_config = None
 
     kwargs = {
         "train_config": train_config,

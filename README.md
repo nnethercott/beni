@@ -24,24 +24,26 @@
 * [x] v0 llava-style vlm trained [11/08/24]
 * [x] multi dataloader and length-ordered datasets for optimized training [11/08/24]
 * [ ] cross-attention vlm archi 
-* [ ] support generic propmt templates in dataset module & model forward
+* [x] support generic propmt templates in dataset module & model forward [26/08/24]
 * [ ] alt quantization schemes (e.g. HQQ) 
 * [ ] DLoRA 
-* [ ] play around with sequence packing in train
 * [x] perceiver resampler [14/08/24]
     * either use the idefics2 one or we use our own implementation (test both) 
 * [ ] interpolate positional embeddings for high res images in vision encoder
+    * native support exists for siglip 
     * adding high res on clip will require us making our own clip fork
     * add better check that `interpolate_pos_encoding` in vision.forward fn signature
 * [x] `enable_inputs_require_grads` for lora training & fsdp 
 * [x] make `BeniConfig` subclass hf config so we can peft beni and `.save_pretrained`
 * [x] add a demo subdir with docker compose for spinning up model worker, flask server, and gradio app [15/08/24]
     * [this commit](https://github.com/Deepomatic/vlm_dev/commit/ffc2e11e57aaac8ec63679978cbedef44bba3e41)
-* [ ] check perf of normal computer vision models like resnet
 * [ ] `torch.jit.trace` model forward pass and check idle vs nonidle time 
 * [ ] quantized/qlora training
     * need to make `quant_storage_type` same as `compute_dtype` so layers get flattened properly in fsdp
     * **need to add scaler and mixed precision decorators for llm forward call if quantization enabled**
+* [ ] resolve the following; prompt token masking not yet configured for multi-turn conversations; image tokens inserted in a fixed location, no dynamic placement in user prompt 
+* [ ] make connector architecture configureable from a string in the model config 
+    * use transformers activation map 
 
 # Usage
 Training is configured parametrically using various config objects which get passed to a launch script. These configs allow for defining optional model components (e.g. the `PerceiverResamplerConfig`) and control aspects like model architecture and training hyperparameters.

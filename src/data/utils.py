@@ -264,13 +264,13 @@ def apply_chat_template(
     """
     if instruction_template is None:
         instruction_template = (
-            tok.bos_token + "{prompt}" + tok.eos_token
+            tok.bos_token + "{instruction}" + tok.eos_token
         )  # <s>prompt</s>
     if response_template is None:
         response_template = "{response}" + tok.eos_token
 
     def process(samples):
-        prompts = [instruction_template.format(prompt=p) for p in samples["prompt"]]
+        prompts = [instruction_template.format(instruction=p) for p in samples["prompt"]]
         responses = [response_template.format(response=r) for r in samples["response"]]
         inputs = [p + r for p, r in zip(prompts, responses)]
 

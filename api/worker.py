@@ -10,6 +10,7 @@ from dataclasses import (
     dataclass,
     asdict,
 )
+import json
 
 import sys
 import time
@@ -35,24 +36,15 @@ quantization_config = BitsAndBytesConfig(
     bnb_4bit_quant_type="nf4",
     bnb_4bit_use_double_quant=False
 )
+CKPT_DIR=os.getenv("MODEL_CHECKPOINT", None)
 
-cfg = BeniConfig(
-    vision_name_or_path = "google/siglip-so400m-patch14-384",
-    #text_name_or_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    text_name_or_path = "HuggingFaceTB/SmolLM-360M-Instruct",
-    vision_cls = "SiglipVisionModel",
-    vision_processor_cls = "SiglipImageProcessor",
-    r = 9,
-    freeze = True,
-    use_cls = True,
-    attn_implementation="sdpa",
-    img_size = 384,
-    feature_select_index = -1,
-)
+with open(f"{CKPT_DIR}/../model_config.json", 'r') as f:
+    MODEL_CONFIG = BeniConfig(**json.loads(f.read()))
+
 
 # defined globally
-model = Beni(cfg)
-model = load_model(model, ckpt_dir=os.getenv("MODEL_CHECKPOINT", None))
+model = Beni(MODEL_CONFIG, os.getenv("HF_ACCESS_TOKEN"))
+model = load_model(model, ckpt_dir=CKPT_DIR)
 device = "cuda"
 model.to(device)
 model.eval()
@@ -114,10 +106,8 @@ def apply_chat_template(messages, tokenizer):
     #if text is not None:
         #text = text + tokenizer.eos_token + '\n' # custom template i made
 
-    convo = [{'role': 'user', 'content': text}]
-    text = tokenizer.apply_chat_template(convo, tokenize=False)  # tokenizer's built-in chat template
-    #template = "<|im_start|>user\n{prompt}<|im_end|>assistant\n"
-    #text = template.format(prompt=text)
+    # might fail if no instruction template provided in train
+    text = MODEL_CONFIG.instruction_template.format(instruction=text)
 
     return text, url
 
@@ -213,7 +203,7 @@ def chat_completion(model, prompt, image = None, **generation_kwargs):
       "choices": choices,
       "created": int(time.time()),
       "id": str(uuid.uuid4()),
-      "model": "beni", # model.config._name_or_path.split("/")[-1], #TODO: add this fr 
+      "model": "bleh", # model.config._name_or_path.split("/")[-1], #TODO: add this fr 
       "object": "chat_completion",
       "usage": usage, 
     }
