@@ -113,9 +113,9 @@ class BeniConfig:
     attn_implementation: str = "eager"
     text_config = None
     vision_config = None
-    bos_token: Optional[Union[str, List[int]]] = None
-    instruction_template: str = None
-    response_template: str = None
+    bos_token: Optional[Union[str, List[int]]] = "<s>user:"
+    instruction_template: str = "<s>user:\n{instruction}\n</s>assistant:\n"
+    response_template: str = "{response}</s>"
     llm_quantization_config: Optional[Any] = None
 
     def to_dict(self):
@@ -420,14 +420,13 @@ class Beni(nn.Module):
 
 if __name__ == "__main__":
     import sys
-    import json
 
     sys.path.insert(1, "../")
     from data import *
     import io
     import requests
     from peft import PeftModel
-    from .vision import PerceiverResamplerConfig, DragonFlyConfig
+    from .vision import PerceiverResamplerConfig
 
     perceiver_config = PerceiverResamplerConfig(
         hidden_size=1152,  # from siglip.config
@@ -444,16 +443,8 @@ if __name__ == "__main__":
         r=1,
         feature_select_index=-1,
         use_cls=True,
-        img_sizes=[224, 448],
-        sparsity_plugins=[
-            DragonFlyConfig(
-                top_k=128,
-                num_patches=4,
-                img_sizes=[224, 448],
-                vit_stride=14,
-                use_cls=True,
-            )
-        ],
+        img_size=384,
+        sparsity_plugins=None,
         perceiver_config=None,
     )
 
@@ -468,10 +459,10 @@ if __name__ == "__main__":
     )
 
     # loading from checkpoint
-    ckpt = "/mnt/nate/model_checkpoints/stablelm/step6039"
-    with open(f"{'/'.join(ckpt.split('/')[:-1])}/model_config.json", "r") as f:
-        config_dict = json.loads(f.read())
-        model_config = BeniConfig.from_dict(config_dict)
+    # ckpt = "/mnt/nate/model_checkpoints/stablelm/step6039"
+    # with open(f"{'/'.join(ckpt.split('/')[:-1])}/model_config.json", "r") as f:
+    #     config_dict = json.loads(f.read())
+    #     model_config = BeniConfig.from_dict(config_dict)
 
     # inject quantization config ?
     from transformers import BitsAndBytesConfig
@@ -484,8 +475,9 @@ if __name__ == "__main__":
     )
     model_config.llm_quantization_config = quantization_config
     print(model_config)
+
     beni = Beni(model_config)
-    beni.connector.load_state_dict(torch.load(f"{ckpt}/connector.pt"))
+    # beni.connector.load_state_dict(torch.load(f"{ckpt}/connector.pt"))
     print(beni)
 
     beni.to(torch.float16)
@@ -504,8 +496,10 @@ if __name__ == "__main__":
         )
     ).convert("RGB")
     print(img)
+
     # sentence = "provide a descriptive caption for this image"
     sentence = ""
+
     template = model_config.instruction_template
     inputs = beni.tokenizer(
         template.format(instruction=sentence),
@@ -540,22 +534,22 @@ if __name__ == "__main__":
         if isinstance(v, torch.Tensor):
             inputs[k] = v.to(beni.device)
 
-    # out = beni(**inputs)
-    print("generating...")
-    out = beni.generate(
-        **inputs,
-        max_new_tokens=128,
-        # temperature=0.7,
-        # top_p=0.95,
-        num_beams=3,
-        num_return_sequences=1,
-        do_sample=False,
-        eos_token_id=[
-            beni.tokenizer.eos_token_id,
-            beni.tokenizer.pad_token_id,
-        ],
-    )
-    if "input_ids" in inputs.keys():
-        print(beni.tokenizer.batch_decode(inputs["input_ids"]))
+    out = beni(**inputs)
+    # print("generating...")
+    # out = beni.generate(
+    #     **inputs,
+    #     max_new_tokens=128,
+    #     # temperature=0.7,
+    #     # top_p=0.95,
+    #     num_beams=3,
+    #     num_return_sequences=1,
+    #     do_sample=False,
+    #     eos_token_id=[
+    #         beni.tokenizer.eos_token_id,
+    #         beni.tokenizer.pad_token_id,
+    #     ],
+    # )
+    # if "input_ids" in inputs.keys():
+    #     print(beni.tokenizer.batch_decode(inputs["input_ids"]))
 
-    print(beni.tokenizer.batch_decode(out))
+    # print(beni.tokenizer.batch_decode(out))

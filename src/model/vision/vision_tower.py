@@ -3,13 +3,11 @@ from typing import Callable, Optional, List, Union
 
 from collections import OrderedDict
 from PIL import Image
-import copy
 
 import torch
 from torch import nn
 
 from transformers import (
-    AutoProcessor,
     PreTrainedModel,
     SiglipVisionModel,
 )
@@ -21,7 +19,7 @@ from . import sparsity
 @dataclass
 class VisionTowerConfig:
     r: int = 1
-    img_sizes: Optional[Union[dict, int, List[int]]] = None
+    img_size: int = 384
     # image_processors: Optional{AutoProcessor] for grid cropping etc
     use_cls: bool = False
     feature_select_index: int = -1
@@ -61,10 +59,7 @@ class VisionTower(nn.Module):
         )
 
         # image processors
-        if isinstance(config.img_sizes, int):
-            config.img_sizes = [config.img_sizes]
-
-        self.image_processors = self.get_image_processors(processor, config.img_sizes)
+        self.image_processor = self.get_image_processors(processor, config.img_size)
 
         # perceiver resampler
         if config.perceiver_config is not None:
@@ -97,22 +92,15 @@ class VisionTower(nn.Module):
         assert len(dtypes) == 1
         return list(dtypes)[0]
 
-    def get_image_processors(self, processor, img_sizes: List[int]):
-        if len(img_sizes) == 1:
-            self.is_high_res = img_sizes[0] != processor.size
-        else:
-            self.is_high_res = True
+    def get_image_processors(self, processor, img_size: int):
+        self.is_high_res = img_size != processor.size
 
-        processors = []
-        for size in img_sizes:
-            processor_clone = copy.deepcopy(processor)
-            if isinstance(processor_clone.size, dict):
-                processor_clone.size = {"height": size, "width": size}
-            elif isinstance(processor_clone.size, int):
-                processor_clone.size = size
-            processors.append(processor_clone)
+        if isinstance(processor.size, dict):
+            processor.size = {"height": img_size, "width": img_size}
+        elif isinstance(processor.size, int):
+            processor.size = img_size
 
-        return processors
+        return processor
 
     def unfreeze(self):
         if isinstance(self.resampler, PerceiverResampler):
@@ -131,11 +119,11 @@ class VisionTower(nn.Module):
         """
         raise NotImplementedError
 
-    def vit_forward(self, x, processor: AutoProcessor):
+    def vit_forward(self, x):
         try:
-            x = processor(x, return_tensors="pt")["pixel_values"]  # type: ignore
+            x = self.image_processor(x, return_tensors="pt")["pixel_values"]  # type: ignore
         except:
-            # debug
+            # debug (sometimes we get single channel images)
             print(x)
             raise RuntimeError
 
@@ -155,9 +143,7 @@ class VisionTower(nn.Module):
         return x
 
     def forward(self, x, attention_mask=None):
-        # NOTE: need to rethink when variable number of crops exists per image
-        x = [self.vit_forward(x, p) for p in self.image_processors]
-        x = torch.cat(x, dim=1)  # to tensor
+        x = self.vit_forward(x)
         x = self.sparsity(x)
 
         if attention_mask is None:
@@ -174,7 +160,6 @@ class VisionTower(nn.Module):
 
 if __name__ == "__main__":
     from .perceiver import PerceiverResamplerConfig
-    from .sparsity import DragonFlyConfig
     from transformers import SiglipVisionModel, SiglipImageProcessor
     import io
     from PIL import Image
@@ -182,22 +167,9 @@ if __name__ == "__main__":
 
     vision_name_or_path = "google/siglip-so400m-patch14-384"
 
-    img_sizes = [224, 448]
+    img_size = 384
 
-    cfg = VisionTowerConfig(
-        r=1,
-        use_cls=True,
-        img_sizes=img_sizes,
-        sparsity_plugins=[
-            DragonFlyConfig(
-                top_k=11,
-                num_patches=4,
-                img_sizes=img_sizes,
-                vit_stride=14,
-                use_cls=True,
-            )
-        ],
-    )
+    cfg = VisionTowerConfig(r=1, use_cls=True, img_size=img_size, sparsity_plugins=None)
 
     vision = SiglipVisionModel.from_pretrained(vision_name_or_path)
     processor = SiglipImageProcessor.from_pretrained(vision_name_or_path)
@@ -210,4 +182,5 @@ if __name__ == "__main__":
             ).content
         )
     ).convert("RGB")
+
     out = vt([img])

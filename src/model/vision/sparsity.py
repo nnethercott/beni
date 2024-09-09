@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
-from typing import Type, List
+from dataclasses import dataclass
+from typing import Type
 
 import torch
 from torch import nn
@@ -69,66 +69,10 @@ class GumbelSoftmaxSparsityPlugin(nn.Module):
 
 
 # not trainable
-class DragonFlySparsityPlugin(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.top_k = config.top_k
-        self.num_patches = config.num_patches
-        self.img_sizes = config.img_sizes
-        self.vit_stride = config.vit_stride
-        self.use_cls = config.use_cls
-
-        assert (
-            (self.img_sizes[-1] // self.vit_stride) ** 2
-            >= self.num_patches * self.top_k
-        ), f"trying to select {self.num_patches*self.top_k} patches from image with {(self.img_sizes[-1]//self.vit_stride)**2} total patches"
-
-    @classmethod
-    def build(cls, config, **kwargs):
-        return cls(config)
-
-    @torch.no_grad()
-    def forward(self, x):
-        """
-        use self.img_sizes to split and patch select
-        ensure num patches common divisor of img_sizes
-        """
-        i = 1 - int(self.use_cls)
-        num_low_res_patches = (self.img_sizes[0] // self.vit_stride) ** 2 - i
-        low_res = x[:, :num_low_res_patches, :]
-        high_res = x[:, num_low_res_patches:, :]
-
-        bsz, seq_len, d = low_res.shape
-
-        low_res = low_res.view(bsz, self.num_patches, -1, d)
-        low_res = low_res / low_res.norm(dim=-1, p=2, keepdim=True)
-
-        high_res = high_res.view(bsz, self.num_patches, -1, d)
-        high_res = high_res / high_res.norm(dim=-1, p=2, keepdim=True)
-
-        # normalized inner product
-        inner = low_res.mean(dim=2, keepdim=True) @ high_res.transpose(-1, -2)
-        _, idx = inner.topk(self.top_k, dim=-1)
-        idx = idx.transpose(-1, -2).expand(
-            -1, -1, -1, d
-        )  # [bsz, num_pathes, top_k, 1] -> [bsz, num_pathes, top_k, d]
-        high_res = high_res.gather(2, idx)
-
-        high_res = high_res.view(bsz, -1, d)
-        low_res = low_res.view(bsz, -1, d)
-
-        return torch.cat((low_res, high_res), dim=1)
-
-
-# register all plugins
-@sparsity_plugin(DragonFlySparsityPlugin)
-class DragonFlyConfig:
-    top_k: int = 64
-    num_patches: int = 4
-    img_sizes: List[int] = field(default_factory=lambda: [384])
-    vit_stride: int = 14
-    use_cls: bool = False
-    trainable: bool = False
+class BilinearInterpolationSparsityPlugin(nn.Module):
+    # llava-next
+    # F.interpolate(patches, size=size, mode="bilinear", align_corners=False)
+    pass
 
 
 @sparsity_plugin(GumbelSoftmaxSparsityPlugin)
