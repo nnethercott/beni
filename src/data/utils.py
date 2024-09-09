@@ -1,26 +1,15 @@
 import datasets
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import os
-from typing import Callable
-import functools
 import random
-from tqdm import tqdm
+from urllib.parse import urlparse
 
-from concurrent.futures import ThreadPoolExecutor
 import requests
 from PIL import Image
 import io
 
-"""
-NOTES:
-    * should sort samples by length and guesstimate boundaries based on # tokens 
-        * e.g. batches of varying sizes depending on number of total tokens 
-
-IDEA:
-    * stateful DataLoader subclass which modifies batch size based on last seen sequence length of an ordered dataset
-        * can adjust batch size dynamically for us
-"""
+from .minhash import *
 
 
 # torch.utils.data.Dataset subclass
@@ -44,18 +33,17 @@ class CustomDataset(Dataset):
         return self.data[i]
 
 
-# TODO: use this to download images instead of dynamic get
-class CustomDatasetForImages(CustomDataset):
-    def __init__(self, data, cache=True, request_timeout: float = 3.0):
-        super().__init__(data)
-        self.offset = 0
-        self.cache = cache
+class LazyCustomDatasetForImages(CustomDataset):
+    def __init__(self, data, request_timeout: float = 3):
+        CustomDataset.__init__(self, data)
         self.timeout = request_timeout
 
-        self.build()
-        self.trim()
-
     def get_image(self, url):
+        # local images
+        if urlparse(url).scheme == "":
+            return Image.open(url).convert("RGB")
+
+        # fetch from online
         try:
             return Image.open(
                 io.BytesIO(requests.get(url, timeout=self.timeout).content)
@@ -63,68 +51,18 @@ class CustomDatasetForImages(CustomDataset):
         except:
             raise RuntimeError(f"image: {url} could not be downloaded !")
 
-    # @override
-    def __getitem__(self, i):
-        if self.cache:
-            return self.data[i]
-
-        img = self.get_image(i)
-        return {**self.data[i], "images": img}
-
-    def build(self):
-        urls_enumed = [(e, d["url"]) for e, d in enumerate(self.data)]
-
-        def download(idx, url):
-            try:
-                img = self.get_image(url)
-                if not len(img.size) == 2 or img.size[:2] <= (1, 1):  # edge cases
-                    return (idx, None)
-
-                if self.cache:
-                    self.data[idx] = {**self.data[idx], "images": img}
-                return (idx, img)
-            except:
-                return (idx, None)
-
-        with ThreadPoolExecutor(
-            max_workers=int(os.environ.get("OMP_NUM_THREADS", 16))
-        ) as executor:
-            res = list(
-                tqdm(
-                    executor.map(lambda args: download(*args), urls_enumed),
-                    total=len(urls_enumed),
-                )
-            )
-
-        # remove bad ids from data
-        # nice leet code stuff
-        bad_ids = [p[0] for p in res if p[1] is None]
-        bad_ids = sorted(bad_ids)[::-1]
-        for idx in bad_ids:
-            self.data.pop(idx)
-
-        return self
-
-    def trim(self):
-        if torch.distributed.is_initialized():
-            # broadcast self.data lengths and choose min
-            pass
-
-
-# no build at init
-class LazyCustomDatasetForImages(CustomDatasetForImages):
-    def __init__(self, data, request_timeout: float = 3):
-        CustomDataset.__init__(self, data)
-        self.timeout = request_timeout
-
     def __getitem__(self, idx):
+        sample = self.data[idx]
+        assert "url" in sample.keys(), "sample with no `url` field detected!"
+
         try:
-            img = self.get_image(self.data[idx]["url"])
-            if len(img.size) > 2 or img.size[:2] == (1, 1):
+            img = self.get_image(sample["url"])
+            if len(img.size) != 2 or img.size[:2] == (1, 1):
                 img = None
         except:
             img = None
-        return {**self.data[idx], "images": img}
+
+        return {**sample, "images": img}
 
 
 # can use this for diverse batch sizes in normal dataset ordered by context length too
@@ -248,20 +186,6 @@ def apply_chat_template(
     instruction_template=None,
     response_template=None,
 ):
-    """
-    Arguments:
-        - data: lazy dataset loaded with `streaming=True`. dataset should have column 'response'. if no 'prompt' present we use ''
-        - tok: tokenizer
-        - template: optional syntaxing
-        - n: how many samples to load
-        - preprocess: optional preprocessing mapped before the boilerplate
-        - ctx_len: max length for input ids
-        - trim: if true we truncate samples exceeding max length, else we filter them out
-
-    features:
-        - adds EOS token to the end of each text entry -> formats like SOS+encoded+EOS
-            - ensures free lunch with pure-text datasets, image ones handled by vlm
-    """
     if instruction_template is None:
         instruction_template = (
             tok.bos_token + "{instruction}" + tok.eos_token
@@ -269,8 +193,11 @@ def apply_chat_template(
     if response_template is None:
         response_template = "{response}" + tok.eos_token
 
+    # apply chat template to samples
     def process(samples):
-        prompts = [instruction_template.format(instruction=p) for p in samples["prompt"]]
+        prompts = [
+            instruction_template.format(instruction=p) for p in samples["prompt"]
+        ]
         responses = [response_template.format(response=r) for r in samples["response"]]
         inputs = [p + r for p, r in zip(prompts, responses)]
 

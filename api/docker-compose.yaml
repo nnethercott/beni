@@ -1,0 +1,24 @@
+version: '3'
+services:
+  worker:
+    build:
+      context: ../
+      dockerfile: api/worker/Dockerfile
+    ports:
+      - "5001:5001"
+    volumes:
+      - ${HF_HOME}:/home/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+
+  chatbot:
+    build:
+      context: .
+      dockerfile: ./chatbot/Dockerfile
+    # volumes:
+    #   - ./tmpimages:/home/tmpimages # gradio image cache
+    environment:
+      - GRADIO_TEMP_DIR=/home/tmpimages 
+      - GRADIO_DEBUG=1
+      - GRADIO_SHARE="True"
+      #- GRADIO_SERVER_NAME="0.0.0.0"

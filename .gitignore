@@ -8,3 +8,4 @@ src/model_checkpoints
 api/tmpimages
 src/data/data
 **/*.ipynb_checkpoints
+requirements.txt

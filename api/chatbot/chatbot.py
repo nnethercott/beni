@@ -6,6 +6,8 @@ import requests
 import json
 import logging
 
+logging.basicConfig(level=logging.INFO)
+
 
 def image_to_base64(image=None):
     buffered = BytesIO()
@@ -50,7 +52,7 @@ def vlm(text_prompt, image=None):
     headers = {"Content-Type": "application/json"}
     res = requests.post(
         # "http://localhost:5001/", headers=headers, data=json.dumps(data)
-        "http://localhost:5001/",
+        "http://worker:5001/",
         headers=headers,
         data=json.dumps(data),
     )
@@ -77,7 +79,7 @@ CSS = """
 """
 
 # Gradio interface components
-with gr.Blocks(theme=theme, fill_height=True) as demo:
+with gr.Blocks(theme=theme) as demo:
     gr.Markdown("# 🦙 chatbot demo")
 
     with gr.Row():

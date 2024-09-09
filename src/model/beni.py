@@ -1,31 +1,22 @@
-from dataclasses import dataclass, asdict, field
-from typing import Callable, Optional, List, Tuple, Union, Any, Callable
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Tuple, Union, Any
 from PIL import Image
-import functools
 import os
-import importlib
+import dacite
 
 import torch
 from torch import nn
-import torch.nn.functional as F
-import torch.distributed as dist
 
 import transformers
 from transformers import (
-    AutoModel,
     AutoConfig,
-    PretrainedConfig,
-    AutoProcessor,
-    PreTrainedModel,
-    AutoModelForCausalLM,
-    LlamaConfig,
     AutoTokenizer,
 )
-from peft import PeftModel, PeftConfig, get_peft_model
+from peft import PeftModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
-from .vision import VisionTower
+from .vision import VisionTower, VisionTowerConfig
 
 
 def rank_0_only(f):
@@ -112,21 +103,16 @@ class Connector(nn.Module):
 
 @dataclass
 class BeniConfig:
-    perceiver_config: Optional[Union[Any, PretrainedConfig]] = None
-    vision_name_or_path: str = None
-    text_name_or_path: str = None
+    text_name_or_path: str
+    vision_name_or_path: str
+    vision_tower_config: VisionTowerConfig
     vision_cls: str = None
     text_cls: str = "AutoModelForCausalLM"
     vision_processor_cls: str = None
-    r: int = 1
-    feature_select_index: int = -1
-    use_cls: bool = False
     freeze: bool = True
     attn_implementation: str = "eager"
-    img_size: Optional[Union[dict, int]] = None
     text_config = None
     vision_config = None
-    sparsity_plugins: List[dict] = None  # list of configs
     bos_token: Optional[Union[str, List[int]]] = None
     instruction_template: str = None
     response_template: str = None
@@ -135,13 +121,18 @@ class BeniConfig:
     def to_dict(self):
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, config_dict):
+        return dacite.from_dict(cls, config_dict)
+
+
 class Beni(nn.Module):
     """
     todo:
         * allow for prompt templates
     """
 
-    def __init__(self, config: BeniConfig, hf_token = None):
+    def __init__(self, config: BeniConfig, hf_token=None):
         super().__init__()
         self.config = config
         self.token = hf_token
@@ -154,7 +145,6 @@ class Beni(nn.Module):
 
         if self.config.freeze:
             self.freeze()
-        
 
     def build_vision_and_text(self, config):
         vision_cls = getattr(transformers, config.vision_cls, "AutoModel")
@@ -166,7 +156,7 @@ class Beni(nn.Module):
         # vision
         v = vision_cls.from_pretrained(config.vision_name_or_path)
         p = vision_processor_cls.from_pretrained(config.vision_name_or_path)
-        self.vision = VisionTower(v, p, config)
+        self.vision = VisionTower(v, p, config.vision_tower_config)
 
         # text
         self.llm = text_cls.from_pretrained(
@@ -211,7 +201,7 @@ class Beni(nn.Module):
 
     @property
     def end_img_token(self):
-        return self.tokenizer.encode("<\img>", add_special_tokens=False)[0]
+        return self.tokenizer.encode("</img>", add_special_tokens=False)[0]
 
     @property
     def device(self):
@@ -227,7 +217,7 @@ class Beni(nn.Module):
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[Union[torch.FloatTensor, torch.Tensor]] = None,
         labels: Optional[torch.LongTensor] = None,
         images: Optional[torch.FloatTensor] = None,  # in reality these are pil images
     ):
@@ -258,7 +248,7 @@ class Beni(nn.Module):
                 tokens = self.tokenizer.encode(bos, add_special_tokens=False)
                 if not isinstance(tokens, list):
                     tokens = [tokens]
-                bos_token = torch.tensor(tokens, device=self.device)
+            bos_token = torch.tensor(tokens, device=self.device)
             bos_len = len(tokens)
         else:
             bos_token = torch.tensor([self.tokenizer.bos_token_id], device=self.device)
@@ -275,6 +265,7 @@ class Beni(nn.Module):
         end_img_embeds = self.embed_tokens(end_img_token).repeat((bsz, 1, 1))
 
         if input_ids is not None:
+            _, vis_len, _ = vision_embeds.shape
             text_embeds = self.embed_tokens(input_ids)
 
             # <bos_seq><img>insert_image_featuers<img>prompt</s>
@@ -288,14 +279,30 @@ class Beni(nn.Module):
                 ),
                 dim=1,
             )
-            input_ids = None  # ensure input_ids is not passed to the model
 
-            _, vis_len, _ = vision_embeds.shape
+            # sanity again
+            # full_seq_en = torch.cat(
+            #     (
+            #         bos_token.repeat((bsz, 1)),
+            #         img_token.repeat((bsz, 1)),
+            #         306
+            #         * torch.ones(
+            #             (bsz, vis_len), dtype=input_ids.dtype, device=self.device
+            #         ),
+            #         end_img_token.repeat((bsz, 1)),
+            #         input_ids[:, bos_len:],
+            #     ),
+            #     dim=-1,
+            # )
+            # for seq in self.tokenizer.batch_decode(full_seq_en):
+            #     print(seq)
+
+            input_ids = None  # ensure input_ids is not passed to the model
 
             # attention_mask
             additional_len = 1 + 1  # added <img> and </img>
-            attention_mask = torch.cat(
-                (
+            attention_mask = torch.cat(  # type: ignore
+                (  # type: ignore
                     torch.ones((bsz, vis_len + additional_len), device=self.device),
                     attention_mask,
                 ),
@@ -347,13 +354,20 @@ class Beni(nn.Module):
             input_ids is not None or images is not None
         ), "You can't forward without text and/or images!"
 
-        #print(self.tokenizer.batch_decode(input_ids))
+        # print(self.tokenizer.batch_decode(input_ids))
         input_ids, attention_mask, inputs_embeds, labels = self.prepare_inputs(
             input_ids, attention_mask, inputs_embeds, labels, images
         )
 
         # print(attention_mask)
-        #print(self.tokenizer.batch_decode(labels.masked_fill(labels==-100, self.tokenizer.encode('X', add_special_tokens=False)[0])))
+        # print(
+        #     self.tokenizer.batch_decode(
+        #         labels.masked_fill(
+        #             labels == -100,
+        #             self.tokenizer.encode("X", add_special_tokens=False)[0],
+        #         )
+        #     )
+        # )
 
         return self.llm(
             input_ids=input_ids,
@@ -376,7 +390,7 @@ class Beni(nn.Module):
         image_sizes: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
-        position_ids = kwargs.pop("position_ids", None)
+        kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
 
         if "inputs_embeds" in kwargs:
@@ -405,15 +419,15 @@ class Beni(nn.Module):
 
 
 if __name__ == "__main__":
-    from datasets import load_dataset
     import sys
+    import json
 
     sys.path.insert(1, "../")
     from data import *
     import io
     import requests
-    from peft import PeftModel, PeftConfig
-    from .vision import *
+    from peft import PeftModel
+    from .vision import PerceiverResamplerConfig, DragonFlyConfig
 
     perceiver_config = PerceiverResamplerConfig(
         hidden_size=1152,  # from siglip.config
@@ -425,59 +439,123 @@ if __name__ == "__main__":
         concat_latents_kv=False,
         attention_dropout=0.1,
     )
-    # perceiver_config = None
-    model_config = BeniConfig(
+
+    vision_tower_config = VisionTowerConfig(
+        r=1,
+        feature_select_index=-1,
+        use_cls=True,
+        img_sizes=[224, 448],
+        sparsity_plugins=[
+            DragonFlyConfig(
+                top_k=128,
+                num_patches=4,
+                img_sizes=[224, 448],
+                vit_stride=14,
+                use_cls=True,
+            )
+        ],
         perceiver_config=None,
+    )
+
+    model_config = BeniConfig(
         vision_name_or_path="google/siglip-so400m-patch14-384",
         text_name_or_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        vision_tower_config=vision_tower_config,
         vision_cls="SiglipVisionModel",
         vision_processor_cls="SiglipImageProcessor",
         freeze=True,
         attn_implementation="eager",
-        img_size=384,
-        r=8,  # don't use this with perceiver
-        sparsity_plugins=[
-            GumbelConfig(hidden_size=1152, temperature=0.1, p=0.3, lam=0.5)
-        ],
     )
+
+    # loading from checkpoint
+    ckpt = "/mnt/nate/model_checkpoints/stablelm/step6039"
+    with open(f"{'/'.join(ckpt.split('/')[:-1])}/model_config.json", "r") as f:
+        config_dict = json.loads(f.read())
+        model_config = BeniConfig.from_dict(config_dict)
+
+    # inject quantization config ?
+    from transformers import BitsAndBytesConfig
+
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="fp4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=False,
+    )
+    model_config.llm_quantization_config = quantization_config
+    print(model_config)
     beni = Beni(model_config)
+    beni.connector.load_state_dict(torch.load(f"{ckpt}/connector.pt"))
     print(beni)
-    beni.to("cuda")
+
+    beni.to(torch.float16)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cpu"
+    print(f"putting on device: {device}")
+    beni.to(device)
 
     inputs = {}
     img = Image.open(
         io.BytesIO(
             requests.get(
-                "https://c.files.bbci.co.uk/C8AF/production/_120357315_moshpit_crowdsurfer_gettyimages_976.jpg"
+                "https://titanicfacts.net/wp-content/uploads/2018/06/titanic-deep-atlantic.jpg"
             ).content
         )
     ).convert("RGB")
-    sentence = "what is this?"
-    template = "{prompt}</s>\n"
-    # inputs = beni.tok(template.format(prompt=sentence), return_tensors='pt')
-    inputs["images"] = [
-        img,
-    ]
+    print(img)
+    # sentence = "provide a descriptive caption for this image"
+    sentence = ""
+    template = model_config.instruction_template
+    inputs = beni.tokenizer(
+        template.format(instruction=sentence),
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    # inputs['labels'] = inputs['input_ids']
+    inputs["images"] = [img]
+
+    # from data import load_recap, sft_collate_fn
+    # import functools
+    # from torch.utils.data import DataLoader
+
+    # data = load_allava_laion(
+    #     beni.tokenizer,
+    #     n=100,
+    #     instruction_template=beni.config.instruction_template,
+    #     response_template=beni.config.response_template,
+    # )
+    # inputs = next(
+    #     iter(
+    #         DataLoader(
+    #             data,
+    #             batch_size=4,
+    #             shuffle=True,
+    #             collate_fn=functools.partial(sft_collate_fn, tok=beni.tokenizer),
+    #         )
+    #     )
+    # )
 
     for k, v in inputs.items():
         if isinstance(v, torch.Tensor):
             inputs[k] = v.to(beni.device)
 
+    # out = beni(**inputs)
+    print("generating...")
     out = beni.generate(
         **inputs,
-        max_new_tokens=256,
-        do_sample=False,
+        max_new_tokens=128,
+        # temperature=0.7,
+        # top_p=0.95,
         num_beams=3,
         num_return_sequences=1,
+        do_sample=False,
+        eos_token_id=[
+            beni.tokenizer.eos_token_id,
+            beni.tokenizer.pad_token_id,
+        ],
     )
+    if "input_ids" in inputs.keys():
+        print(beni.tokenizer.batch_decode(inputs["input_ids"]))
+
     print(beni.tokenizer.batch_decode(out))
-
-    # out = beni(**inputs)
-    # loss = out['loss']
-    # loss.backward()
-
-    # for p in beni.connector.parameters():
-    #    print(p.grad)
-    #
-    # optimizer.step()
-    # optimizer.zero_grad()

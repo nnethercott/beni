@@ -9,6 +9,7 @@
 * [minigptv](https://github.com/Vision-CAIR/MiniGPT-4) (concat of visual tokens, llava-style archi)
 
 ### papers and articles 
+* [fuzzy deduplication with minhash]("https://blog.nelhage.com/post/fuzzy-dedup/")
 * [estimating transformer FLOPs](https://www.adamcasson.com/posts/transformer-flops)
 * [making gpus go brrr](https://horace.io/brrr_intro.html)
 * [idefics2](https://arxiv.org/pdf/2405.02246)
@@ -26,7 +27,7 @@
 * [ ] cross-attention vlm archi 
 * [x] support generic propmt templates in dataset module & model forward [26/08/24]
 * [ ] alt quantization schemes (e.g. HQQ) 
-* [ ] DLoRA 
+* [x] DLoRA 
 * [x] perceiver resampler [14/08/24]
     * either use the idefics2 one or we use our own implementation (test both) 
 * [ ] interpolate positional embeddings for high res images in vision encoder
@@ -38,12 +39,14 @@
 * [x] add a demo subdir with docker compose for spinning up model worker, flask server, and gradio app [15/08/24]
     * [this commit](https://github.com/Deepomatic/vlm_dev/commit/ffc2e11e57aaac8ec63679978cbedef44bba3e41)
 * [ ] `torch.jit.trace` model forward pass and check idle vs nonidle time 
-* [ ] quantized/qlora training
+* [x] quantized/qlora training
     * need to make `quant_storage_type` same as `compute_dtype` so layers get flattened properly in fsdp
     * **need to add scaler and mixed precision decorators for llm forward call if quantization enabled**
 * [ ] resolve the following; prompt token masking not yet configured for multi-turn conversations; image tokens inserted in a fixed location, no dynamic placement in user prompt 
 * [ ] make connector architecture configureable from a string in the model config 
     * use transformers activation map 
+* [ ] use meta's memory trace tool to get max cuda memory allocated and reallocations, etc
+* [x] quantized generation [09/09/24] 
 
 # Usage
 Training is configured parametrically using various config objects which get passed to a launch script. These configs allow for defining optional model components (e.g. the `PerceiverResamplerConfig`) and control aspects like model architecture and training hyperparameters.
@@ -109,6 +112,28 @@ This structure aims to let users quickly iterate with different architectural ch
 
 We mainly use the hugging face API in this project which assumes models have specific properties and/or methods (e.g. embedding dimension usually indexed with `hidden_size`, llms have both a `generate` and `forward` defined). Of course this won't be the case for all models you want to train with, but it should cover a wide variety of models hosted on HF.
 
+
+## fsdp gotchas
+* transformers are made up of sequential blocks with residual connections. if we shard model parameters between gpus then a tensor op like $x+f(x)$ where `x.device=cuda:0` and `f(x).device=cuda:1` may break training. To resolve this we specify which layers to wrap in the fsdp config.  
+    * if fine tuning an llm which has weight tying activated (`lm_head` = `embed_tokens`) then the embedding weights might simultaneously be needed to convert tokens to embeddings or hidden states to logits. this poses a race condition which breaks training. Solution in this case is to wrap the `nn.Embedding` layer in a fsdp module. 
+* a multimodal training dataset consisting of both image-text pairs and just text samples will activate different parts of the network. the `model.connector` has no gradients when pure text is used. thus the gradient all reduce in fsdp will break since we're trying to average out tensors between gpus which may not exist on others
+    * the `data.utils.MultiLoader` was created to solve this (ensures each devices sees the same modality per iteration)
+* original code for the training loop looked like:
+```python
+for e, batch in enumerate(dataloader):
+    if batch is None: # batch can be none since we load images from web at runtime
+        continue:
+    ...
+    if e%save_steps == 0:
+        dist.barrier() # all ranks suspend execution until reaching this
+        save_model(model)
+```
+the issue with this is that if we skip a batch one rank may encounter the `save_model` block before others and will not participate in fsdp model forward, thus leading to nccl watchdog timeout 
+* fsdp shards must consist of uniform data types. techniques like llm quantization, where params are stored in low precision datatypes, do not play nice with fsdp. Thus QLoRA is made more difficult since we must store quantized weights in half precision (and convert model to half precision as well).
+    * this acheives 2x memory reduction which is less than the llm_size/4 + vit_size/2 > 2x reduction we get from llm 4bit quantization normally 
+    * this also means we need to scale and unscale half precision loss since `torch.float16` has a small dynamic range (otherwise nans). Ideally we'd use `torch.bfloat16` since it has 8bit exponents vs float16 5bit, but this only works on nvidia gpus with Ampere architecture or newer.
+
+
 ## ideas
 Test these with same random seed over same datasets for fixed training steps
 * img feature selection
@@ -132,10 +157,6 @@ Test these with same random seed over same datasets for fixed training steps
         * the auxiliary network would map the image patch to $[\alpha, \beta] \in \mathbb{R}^{2}$
         * i think we'd have to do a pretraining to determine the weights of the gating network and then when we finetune for real we can igore any token which is "turned off" by dropping it from the sequence. otherwise we can't jointly train the network on dynamically-determined variable-length sequences 
         * *need to override the positional embeddings of zeroed out patches during pretraining i think* maybe
-
-        
-
-        
 
         
 

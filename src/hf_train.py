@@ -1,53 +1,42 @@
 import functools
 import os
-import time
-import json
 import uuid
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
     ShardingStrategy,
-    CPUOffload,
-    BackwardPrefetch,
-    MixedPrecision,
-    FullStateDictConfig,
     StateDictType,
 )
 
 from transformers import (
     Trainer,
-    AutoTokenizer,
-    AutoModelForCausalLM,
     TrainingArguments,
 )
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
 
 # new
-from trl import SFTTrainer
-from accelerate import FullyShardedDataParallelPlugin, Accelerator
+from accelerate import FullyShardedDataParallelPlugin
 from peft import LoraConfig, get_peft_model
 
 from model.vision import *
 from data import *
-from policies.wrapping import fsdp_auto_wrap_policy, get_llama_wrapper
-import policies
-from utils.train_utils import (
-    clear_gpu_cache,
-    setup_environ_flags,
-    get_cosine_schedule_with_warmup,
-)
-from configs import TrainConfig, WandbConfig, FSDPConfig
-from checkpointing import save_model, load_model
+from policies.wrapping import fsdp_auto_wrap_policy
+from configs import WandbConfig
+from checkpointing import save_model
 from model import Beni, BeniConfig
 
 TOKEN = os.getenv("HF_ACCESS_TOKEN", None)
 
-lora_config = LoraConfig(r=4, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none')
+lora_config = LoraConfig(
+    r=4,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    bias="none",
+)
 
 model_config = BeniConfig(
     perceiver_config=None,
@@ -61,6 +50,9 @@ model_config = BeniConfig(
     r=9,
     feature_select_index=-1,
     use_cls=True,
+    bos_token="<s><|user|>",
+    instruction_template="<s><|user|>\n{instruction}</s>\n<|assistant|>\n",  # all tokens we want no loss on
+    response_template="{response}</s>",
 )
 model = Beni(model_config, hf_token=TOKEN)
 model.to(torch.float16)
@@ -89,7 +81,7 @@ class MyTrainingArguments(TrainingArguments):
 
 training_args = MyTrainingArguments(
     output_dir="/mnt/nate/beni/hf_test",
-    per_device_train_batch_size=13,
+    per_device_train_batch_size=10,
     gradient_accumulation_steps=1,
     learning_rate=4e-04,
     weight_decay=0.0,
@@ -112,11 +104,11 @@ training_args = MyTrainingArguments(
     fsdp=True,
     optim="adamw_torch",
     report_to="wandb",
-    run_name = os.environ["WANDB_NAME"],
+    run_name=os.environ["WANDB_NAME"],
     dataloader_pin_memory=True,
     fp16=True,
     half_precision_backend="auto",
-    #lora_config = LoraConfig(r=4, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none'),
+    # lora_config = LoraConfig(r=4, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none'),
 )
 
 # fsdp
@@ -148,11 +140,22 @@ fsdp_plugin = FullyShardedDataParallelPlugin(
 )
 
 
+# dataset(s)
+it = model_config.instruction_template
+rt = model_config.response_template
 
-# dataset
-train_dataset = load_recap(
+# train_dataset = load_recap(
+#    model.tokenizer,
+#    n=50000,
+#    instruction_template=it,
+#    response_template=rt,
+# )
+
+train_dataset = load_allava_laion(
     model.tokenizer,
-    n=70000,
+    n=200000,
+    instruction_template=it,
+    response_template=rt,
 )
 
 
@@ -165,7 +168,9 @@ class MyTrainer(Trainer):
 
         if self.args.local_rank == 0:
             params = sum((p.numel() for p in self.model.parameters()))
-            trainable = sum((p.numel() for p in self.model.parameters() if p.requires_grad))
+            trainable = sum(
+                (p.numel() for p in self.model.parameters() if p.requires_grad)
+            )
             print(
                 f"VLM with: {params/1e9:.1f}B params | {100*trainable/params:.2f}% trainable\n"
             )
@@ -176,12 +181,14 @@ class MyTrainer(Trainer):
             self.model.llm = get_peft_model(self.model.llm, self.args.lora_config)
 
     def get_train_dataloader(self):
+        # todo; override this with multidataloader and write new dataset object
         return DataLoader(
             self.train_dataset,
             batch_size=self.args.train_batch_size,
             collate_fn=functools.partial(sft_collate_fn, tok=model.tokenizer),
             drop_last=self.args.dataloader_drop_last,
             num_workers=self.args.dataloader_num_workers,
+            shuffle=True,
         )
 
     def _save_checkpoint(self, model, trial, metrics=None):
@@ -204,11 +211,8 @@ trainer = MyTrainer(
     model=model,
     tokenizer=model.tokenizer,
     args=training_args,
-    # max_seq_length=512,
     train_dataset=train_dataset,
     eval_dataset=None,
-    # formatting_func=formatting_prompts_func,
-    # callbacks=[EfficiencyCallback()],
 )
 
 # https://huggingface.co/docs/peft/en/accelerate/fsdp

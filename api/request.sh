@@ -1,7 +1,7 @@
 curl http://127.0.0.1:5001/ \
   -H "Content-Type: application/json" \
   -d '{
-      "model": "beni1.6b",
+      "model": "model",
       "messages": [
         {
           "role": "system",

@@ -2,46 +2,35 @@ import random
 import functools
 import os
 import time
-from dataclasses import dataclass, field, asdict
-from typing import Optional, List
+from dataclasses import asdict
 import copy
 import json
 import uuid
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
-    ShardingStrategy,
-    CPUOffload,
-    BackwardPrefetch,
-    MixedPrecision,
-    FullStateDictConfig,
-    StateDictType,
-)
-
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    AutoConfig,
-    HfArgumentParser,
-    BitsAndBytesConfig,
 )
 
 # fsdp layers
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.clip.modeling_clip import CLIPEncoderLayer
+from transformers.models.stablelm.modeling_stablelm import StableLmDecoderLayer
 from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
+from transformers import AutoTokenizer
 
-from peft import LoraConfig, PeftModel, get_peft_model
+from peft import get_peft_model
 
 # local
-from model.vision import *
-from data import *
-from policies.wrapping import fsdp_auto_wrap_policy, get_llama_wrapper
+from model.vision import VisionTower, VisionTowerConfig
+from data import (
+    MinHashLSHDeduplicator,
+    load_recap,
+    MultiDataLoader,
+    sft_collate_fn,
+)
+from policies.wrapping import fsdp_auto_wrap_policy
 import policies
 from utils.train_utils import (
     clear_gpu_cache,
@@ -70,6 +59,83 @@ def cleanup():
     dist.destroy_process_group()
 
 
+def fuzzy_filter(*datasets, tokenizer: AutoTokenizer):
+    """
+    use dataset.data so we avoid loading images
+    """
+    datasets = list(datasets)
+
+    # for some reason dataset.Dataset.to_list() converts pil images to bytes so we need
+    # to update the CustomDataset.data attribute AFTER creation
+
+    text_only = []
+    for d in datasets:
+        if isinstance(d.data, dict):
+            d.data = [dict(zip(d.data, t)) for t in zip(*d.data.values())]
+        text_only.append([item["response"] for item in d.data])
+
+    # fuzzy deduplication with minhash
+    minhash = MinHashLSHDeduplicator(tokenizer, *text_only)
+    duplicate_ids = minhash.deduplicate(jaccard_sim=0.85, num_perm=128)
+
+    print(f"{len(duplicate_ids)} duplicates detected!\nremoving them now...")
+
+    # clean original datasets
+    for e, id_list in enumerate(duplicate_ids):
+        for idx in id_list[::-1]:
+            _ = datasets[e].data.pop(idx)
+
+    dist.barrier()
+    return datasets
+
+
+def get_dataloader(tokenizer, model_config, train_config):
+    instruction_template = model_config.instruction_template
+    response_template = model_config.response_template
+
+    # recap
+    print("loading recap...")
+    recap = load_recap(
+        tokenizer,
+        n=100000,
+        instruction_template=instruction_template,
+        response_template=response_template,
+    )
+
+    # optimized ordering of samples for uniform seq lengths
+    def sort_batch_shuffle(data, winsize):
+        data = sorted(data, key=lambda x: len(x["input_ids"]))
+        data = [
+            data[winsize * i : winsize * (i + 1)]
+            for i in range(len(data) // winsize + 1)
+        ]
+        random.shuffle(data)
+        data = [x for xs in data for x in xs]  # thanks stack
+        return data
+
+    for dataset in [recap]:
+        dataset.data = sort_batch_shuffle(dataset.data, train_config.batch_size)
+
+    # multidataloader
+    loaders = (
+        DataLoader(
+            d,
+            batch_size=train_config.batch_size,
+            collate_fn=functools.partial(sft_collate_fn, tok=tokenizer),
+            num_workers=1,
+            pin_memory=True,
+            shuffle=False,
+        )
+        for d in [recap]
+    )
+
+    dl = MultiDataLoader(
+        *loaders, seed=42 + dist.get_rank()
+    )  # each rank should see same modality when seed=int (but not when we use rank info)
+
+    return dl
+
+
 def fsdp_main(model_config, **kwargs):
     # parse kwargs from launch script
     # parser = HfArgumentParser((TrainConfig, FSDPConfig, WandbConfig))
@@ -81,7 +147,7 @@ def fsdp_main(model_config, **kwargs):
     lora_config = kwargs.get("lora_config", None)
 
     rank = int(os.getenv("LOCAL_RANK", 0))
-    world_size = int(os.getenv("WORLD_SIZE", 1))
+    int(os.getenv("WORLD_SIZE", 1))
     seed_everything(rank)
 
     model_config_copy = copy.deepcopy(asdict(model_config))
@@ -97,12 +163,12 @@ def fsdp_main(model_config, **kwargs):
     if rank == 0:
         os.system("pipreqs ../")
         with open("../requirements.txt", "r") as f:
-            configs['pip_env'] = f.read().splitlines()
+            configs["pip_env"] = f.read().splitlines()
 
     wandb_run = wandb_config.build_run(configs, rank == 0)
 
     # setup each cuda device ('device' aliased to cuda:n)
-    if torch.distributed.is_initialized():
+    if dist.is_initialized():
         torch.cuda.set_device(rank)
         clear_gpu_cache(rank)
         setup_environ_flags(rank)
@@ -159,7 +225,7 @@ def fsdp_main(model_config, **kwargs):
             device_id=torch.cuda.current_device(),
             limit_all_gathers=True,
             sync_module_states=True,
-            param_init_fn=lambda module: module.to_empty(
+            param_init_fn=lambda module: module.to_empty(  # type: ignore
                 device=torch.device("cuda"), recurse=False
             )
             if rank != 0
@@ -172,70 +238,22 @@ def fsdp_main(model_config, **kwargs):
 
     else:
         # TODO add non fsdp training
-        pass
+        model = Beni(model_config)
 
     if rank == 0:
-        print(model)
+        print(model)  # type: ignore
         print("trainable params:")
-        for n, p in model.named_parameters():
+        for n, p in model.named_parameters():  # type: ignore
             if p.requires_grad:
                 print(n)
 
-    # data -- # TODO: move later
-    instruction_template = model.config.instruction_template
-    response_template = model.config.response_template
-    dsr = load_recap(
-        model.tokenizer,
-        n=50000,
-        skip=0,
-        instruction_template=instruction_template,
-        response_template=response_template,
-    )
-    dsl = load_allava_laion(
-        model.tokenizer,
-        n=50000,
-        instruction_template=instruction_template,
-        response_template=response_template,
-    )
-    # dst = load_allava_text(model.tokenizer, n = 3000, template = template)
+    dist.barrier()
 
-    # shuffle per rank before multiloader creation
-    # witness something crazy:
-    def sort_batch_shuffle(data, winsize):
-        data = sorted(data, key=lambda x: len(x["input_ids"]))
-        data = [
-            data[winsize * i : winsize * (i + 1)]
-            for i in range(len(data) // winsize + 1)
-        ]
-        random.shuffle(data)
-        data = [x for xs in data for x in xs]  # thanks stack
-        return data
-
-    dsr.data = sort_batch_shuffle(dsr.data, train_config.batch_size)
-    dsl.data = sort_batch_shuffle(dsl.data, train_config.batch_size)
-    # dst.data = sort_batch_shuffle(dst.data, train_config.batch_size)
-
-    dsr = DataLoader(
-        dsr,
-        batch_size=train_config.batch_size,
-        collate_fn=functools.partial(sft_collate_fn, tok=model.tokenizer),
-        num_workers=1,
-        pin_memory=True,
-        shuffle=False,
-    )
-    dsl = DataLoader(
-        dsl,
-        batch_size=train_config.batch_size,
-        collate_fn=functools.partial(sft_collate_fn, tok=model.tokenizer),
-        num_workers=1,
-        pin_memory=True,
-        shuffle=False,
-    )
-    # dst = DataLoader(dst, batch_size = train_config.batch_size, collate_fn = functools.partial(sft_collate_fn, tok=model.tokenizer), num_workers=1, pin_memory=True, shuffle=False)
-    dl = MultiDataLoader(dsr, dsl, seed=42)  # each rank should see same modality
+    # data
+    dl = get_dataloader(model.tokenizer, model.config, train_config)
 
     # optimizer
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.AdamW(  # type: ignore
         model.parameters(),
         lr=train_config.lr,
         weight_decay=train_config.weight_decay,
@@ -262,11 +280,16 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
 
     total_len = len(dl)
     start_time = time.time()
+    prev_batch = {}
+
     for i in range(c.n_epochs):
         for e, batch in enumerate(dl):
             tik = time.time()
-            if batch is None:
-                continue
+            if batch is None:  # if we can't download imgs use previous data
+                print(f"Encountered empty batch on rank {dist.get_rank()}")
+                batch = prev_batch
+            else:
+                prev_batch = batch
 
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
@@ -274,12 +297,7 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
 
             # forward pass
             out = model(**batch, output_attentions=False)
-            llm_loss = out["loss"]
-            vis_loss = model.vision.get_losses()
-
-            loss = llm_loss
-            if vis_loss is not None:
-                loss += vis_loss  # weight lambdas defined in plugins; vis_loss is rly lam*vis_loss
+            loss = out["loss"]
 
             loss = loss / c.gradient_accumulation_steps
             loss.backward()
@@ -295,6 +313,10 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
             if (e + 1) % c.log_steps == 0:
                 dt = time.time() - tik
 
+                # might block
+                dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                loss /= dist.get_world_size()
+
                 if os.environ["LOCAL_RANK"] == "0":
                     print(
                         f"iter: {e+1}/{total_len}  loss: {c.gradient_accumulation_steps*loss.item():.2f}  lr: {scheduler.get_last_lr()[0]:.6f} [{(time.time()-start_time)/60:.2f} < {(dt*total_len/60):.2f}, {dt:.2f}s/it]"
@@ -302,67 +324,76 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
 
             if wandb_run is not None:
                 data = {
-                    "loss": llm_loss.item(),
-                    "ppl": 2 ** (llm_loss.item()),
+                    "loss": c.gradient_accumulation_steps * loss.item(),
+                    "ppl": 2 ** (c.gradient_accumulation_steps * loss.item()),
                     "lr": scheduler.get_last_lr()[0],
                 }
-                # _data = {'p_drop': model.vision.p, 'vis_loss': vis_loss.item()*c.gradient_accumulation_steps}
-                # data = {**data, **_data}
 
                 if rank == 0:
                     wandb_run.log(data)
 
             if (e + 1) % c.save_steps == 0:
+                dist.barrier()
                 save_dir = os.path.join(c.save_path, f"step{e+1}")
-                save_model(
-                    model,
-                    save_dir=save_dir,
-                    rank=rank,
-                    fsdp_checkpoint_type=fsdp_config.checkpoint_type,
-                )  # will break if fsdp config is none
+                save_model(model, save_dir=save_dir, rank=dist.get_rank())
+                dist.barrier()
 
     # training done
     dist.barrier()
 
     # save on epoch end
     save_dir = os.path.join(c.save_path, f"step{total_len}")
-    save_model(
-        model,
-        save_dir=save_dir,
-        rank=rank,
-        fsdp_checkpoint_type=fsdp_config.checkpoint_type,
-    )
+    save_model(model, save_dir=save_dir, rank=dist.get_rank())
 
 
 if __name__ == "__main__":
     setup()
-    perceiver_config = PerceiverResamplerConfig(
-        hidden_size=1152,  # from siglip.config
-        depth=1,
-        n_latents=64,
-        n_query_groups=1,
-        n_heads=16,
-        head_dim=96,
-        concat_latents_kv=True,
-        attention_dropout=0.0,
+    # perceiver_config = PerceiverResamplerConfig(
+    #    hidden_size=1152,  # from siglip.config
+    #    depth=1,
+    #    n_latents=64,
+    #    n_query_groups=1,
+    #    n_heads=32,
+    #    head_dim=64,
+    #    concat_latents_kv=False,
+    #    attention_dropout=0.1,
+    # )
+
+    # img_sizes = [392, 672]  # vs 504
+
+    vision_tower_config = VisionTowerConfig(
+        r=8,
+        feature_select_index=-1,  # think llava does this
+        use_cls=False,
+        img_sizes=384,
+        # sparsity_plugins=[
+        #     DragonFlyConfig(
+        #         top_k=144,
+        #         img_sizes=img_sizes,
+        #         num_patches=4,
+        #         vit_stride=14,
+        #         use_cls=True,
+        #     )
+        # ],
+        sparsity_plugins=None,
+        perceiver_config=None,
     )
 
     model_config = BeniConfig(
-        perceiver_config=None,
         vision_name_or_path="google/siglip-so400m-patch14-384",
-        text_name_or_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # text_name_or_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        text_name_or_path="stabilityai/stablelm-2-1_6b-chat",
+        vision_tower_config=vision_tower_config,
         vision_cls="SiglipVisionModel",
         vision_processor_cls="SiglipImageProcessor",
         freeze=True,
         attn_implementation="eager",
-        img_size=384,
-        r=9,
-        feature_select_index=-1,
-        use_cls=True,
-        sparsity_plugins=None,
-        bos_token="<s><|user|>",
-        instruction_template="<s><|user|>\n{instruction}</s>\n<|assistant|>\n",  # all tokens we want no loss on
-        response_template="{response}</s>",
+        bos_token="<|user|>\n",  # offset needed for img token insert
+        instruction_template="<|user|>\n{instruction}<|endoftext|>\n<|assistant|>\n",  # no loss part
+        response_template="{response}<|endoftext|>\n",  # loss part
+        # bos_token="<s><|user|>",
+        # instruction_template="<s><|user|>\n{instruction}</s>\n<|assistant|>\n",
+        # response_template="{response}</s>",
         # llm_quantization_config = BitsAndBytesConfig(
         #    load_in_4bit = True,
         #    bnb_4bit_compute_dtype=torch.float16,
@@ -373,43 +404,49 @@ if __name__ == "__main__":
 
     train_config = TrainConfig(
         warmup_ratio=0.03,
-        batch_size=7,
-        gradient_accumulation_steps=3,
-        lr=4e-04,
-        weight_decay=0.0,
-        min_lr=4e-05,
+        batch_size=4,
+        gradient_accumulation_steps=4,
+        lr=5e-04,
+        weight_decay=0.1,
+        min_lr=2.5e-04,
         grad_clip=1.0,
-        save_steps=125,
-        log_steps=1,
+        save_steps=1000,
+        log_steps=2,
         ckpt_path=None,
-        save_path="/mnt/nate/beni/vincent_demo",
+        save_path="/mnt/nate/model_checkpoints/stablelm",
         betas=[0.9, 0.95],
         fsdp=True,
-        enable_peft=True,
+        enable_peft=False,
     )
 
     # need this for weight tying: torch.nn.Embedding, # if we upscale images we can't fsdp the positional embeddings ?
     fsdp_config = FSDPConfig(
         transformer_cls=(
-            LlamaDecoderLayer,
+            # LlamaDecoderLayer,
+            StableLmDecoderLayer,
             SiglipEncoderLayer,
-            PerceiverResampler,
-            nn.Embedding,
+            # PerceiverResampler,
+            # nn.Embedding,
             VisionTower,
         ),
         fsdp_activation_checkpointing=False,
         fsdp_cpu_offload=False,
     )
     wandb_config = WandbConfig(
-        enable=False,
+        enable=True,
         project="vlm",
         entity="nnethercott",
         name=model_config.text_name_or_path.split("/")[-1].lower()
         + "-"
         + str(uuid.uuid1()).split("-")[-1],  # model-archi-uuid
     )
-    lora_config = LoraConfig(r=4, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none')
-    #lora_config = None
+    # lora_config = LoraConfig(
+    #    r=4,
+    #    lora_alpha=32,
+    #    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    #    bias="none",
+    # )
+    lora_config = None
 
     kwargs = {
         "train_config": train_config,

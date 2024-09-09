@@ -15,28 +15,18 @@
 """PyTorch Idefics2 model."""
 
 import math
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import CrossEntropyLoss
 
-from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache
 from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
-from transformers.modeling_outputs import BaseModelOutput, ModelOutput
 from transformers.utils import (
     is_flash_attn_2_available,
     is_flash_attn_greater_or_equal_2_10,
-    logging,
-)
-from transformers import AutoModel
-from transformers.models.idefics2.configuration_idefics2 import (
-    Idefics2Config,
-    Idefics2VisionConfig,
 )
 
 
@@ -45,6 +35,9 @@ if is_flash_attn_2_available():
 
 
 from transformers import PretrainedConfig
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class PerceiverResamplerConfig(PretrainedConfig):
@@ -331,9 +324,10 @@ class PerceiverFlashAttention(PerceiverAttention):
 
         past_key_value = (k, v) if use_cache else None
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        k = repeat_kv(k, self.num_query_groups)
-        v = repeat_kv(v, self.num_query_groups)
+        if q.shape != k.shape:
+            k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+            v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
+
         dropout_rate = 0.0 if not self.training else self.attention_dropout
 
         # In PEFT, usually we cast the layer norms in float32 for training stability reasons
@@ -541,8 +535,6 @@ class PerceiverResampler(nn.Module):
 
 
 if __name__ == "__main__":
-    from ..beni import BeniConfig
-
     c = PerceiverResamplerConfig(hidden_size=512, depth=3, n_latents=32)
     p = PerceiverResampler(c)
 

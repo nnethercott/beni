@@ -1,0 +1,5 @@
+[tool.ruff]
+line-length = 88
+extend-exclude = ["*.ipynb"]
+ignore = ['F403', 'E402', 'E722', 'E741']
+exclude = ['src/hf_train.py', 'src/finetuning.py', 'src/fsdp.py']

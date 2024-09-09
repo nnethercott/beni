@@ -1,28 +1,34 @@
 from dataclasses import dataclass
-from typing import Callable, Optional, List, Tuple, Union, ClassVar, Type
+from typing import Callable, Optional, List, Union
+
 from collections import OrderedDict
 from PIL import Image
-import math
+import copy
 
 import torch
 from torch import nn
-import torch.nn.functional as F
-import torch.distributed as dist
 
-import transformers
 from transformers import (
-    AutoModel,
     AutoProcessor,
     PreTrainedModel,
-    AutoModelForCausalLM,
-    AutoConfig,
-    LlamaConfig,
-    AutoTokenizer,
     SiglipVisionModel,
 )
 
-from .perceiver import PerceiverResampler
+from .perceiver import PerceiverResampler, PerceiverResamplerConfig
 from . import sparsity
+
+
+@dataclass
+class VisionTowerConfig:
+    r: int = 1
+    img_sizes: Optional[Union[dict, int, List[int]]] = None
+    # image_processors: Optional{AutoProcessor] for grid cropping etc
+    use_cls: bool = False
+    feature_select_index: int = -1
+    perceiver_config: Optional[PerceiverResamplerConfig] = None
+    sparsity_plugins: Optional[
+        List[Union[sparsity.DragonFlyConfig, sparsity.GumbelConfig]]
+    ] = None
 
 
 class VisionTower(nn.Module):
@@ -38,7 +44,7 @@ class VisionTower(nn.Module):
         self,
         vision: PreTrainedModel,
         processor: Callable[[Image], torch.Tensor],
-        config,
+        config: VisionTowerConfig,
     ):
         # HERE WE ASSUME ONLY THE VISION MODEL IS PASSED. WE WILL SUBCLASS LATER WHEN USING TEXT
         super().__init__()
@@ -48,24 +54,17 @@ class VisionTower(nn.Module):
 
         # for clip/siglip models
         self.vision = vision
-        self.image_processor = processor
 
-        # reshape sequence
+        # update hidden size in vision model config
         setattr(
             self.vision.config, "hidden_size", self.r * self.vision.config.hidden_size
         )
 
-        # image resolution
-        img_size = config.img_size
-        if isinstance(img_size, int) and isinstance(self.image_processor.size, dict):
-            img_size = {"height": img_size, "width": img_size}
-        elif isinstance(img_size, dict) and isinstance(self.image_processor.size, int):
-            img_size = image_size.get("height", None)
-        else:
-            pass
+        # image processors
+        if isinstance(config.img_sizes, int):
+            config.img_sizes = [config.img_sizes]
 
-        self.is_high_res = img_size != self.image_processor.size
-        self.image_processor.size = img_size  # no-op if img_dims is None
+        self.image_processors = self.get_image_processors(processor, config.img_sizes)
 
         # perceiver resampler
         if config.perceiver_config is not None:
@@ -76,7 +75,7 @@ class VisionTower(nn.Module):
         else:
             self.resampler = lambda x, _: nn.Identity()(x)  # no-op
 
-        # sparsity
+        # sparsity: Tensor -> Tensor signature
         if config.sparsity_plugins is not None:
             od = OrderedDict(
                 (
@@ -86,32 +85,34 @@ class VisionTower(nn.Module):
             )
             self.sparsity = nn.Sequential(od)
         else:
-            self.sparsity = lambda x: (nn.Identity()(x), None)
-
-        # self.p = 1
-        self._losses = None
+            self.sparsity = nn.Identity()  # no-op
 
     @property
     def device(self):
         return self.vision.device
 
-    # @property # not working??
-    def get_losses(self):
-        """
-        if trainable feature selection/sparsity networks present
-        recover their losses here
-        """
-        losses = torch.tensor(0.0, device=self.device)
+    @property
+    def torch_dtype(self):
+        dtypes = set((p.dtype for p in self.vision.parameters()))
+        assert len(dtypes) == 1
+        return list(dtypes)[0]
 
-        if isinstance(self.sparsity, nn.Sequential):
-            for n, m in self.sparsity.named_children():
-                if hasattr(m, "losses"):
-                    losses += m.losses
+    def get_image_processors(self, processor, img_sizes: List[int]):
+        if len(img_sizes) == 1:
+            self.is_high_res = img_sizes[0] != processor.size
+        else:
+            self.is_high_res = True
 
-        if losses.is_nonzero():
-            self._losses = losses
+        processors = []
+        for size in img_sizes:
+            processor_clone = copy.deepcopy(processor)
+            if isinstance(processor_clone.size, dict):
+                processor_clone.size = {"height": size, "width": size}
+            elif isinstance(processor_clone.size, int):
+                processor_clone.size = size
+            processors.append(processor_clone)
 
-        return self._losses
+        return processors
 
     def unfreeze(self):
         if isinstance(self.resampler, PerceiverResampler):
@@ -125,10 +126,18 @@ class VisionTower(nn.Module):
     def interpolate_pos_encoding(
         self, embeddings: torch.Tensor, height: int, width: int
     ):
+        """
+        TODO: for clip models
+        """
         raise NotImplementedError
 
-    def vit_forward(self, x):
-        x = self.image_processor(x, return_tensors="pt")["pixel_values"]
+    def vit_forward(self, x, processor: AutoProcessor):
+        try:
+            x = processor(x, return_tensors="pt")["pixel_values"]  # type: ignore
+        except:
+            # debug
+            print(x)
+            raise RuntimeError
 
         fwd_kwargs = {}
         if self.is_high_res:
@@ -138,21 +147,18 @@ class VisionTower(nn.Module):
                 )
             fwd_kwargs["interpolate_pos_encoding"] = True
 
-        x = self.vision(x.to(self.device), output_hidden_states=True, **fwd_kwargs)
-        x = x["hidden_states"][self.feature_select_index][
-            :, self.cls_idx :, :
-        ]  # note: siglip doesnt have [cls] -> add to config
+        x = self.vision(
+            x.to(self.device, self.torch_dtype), output_hidden_states=True, **fwd_kwargs
+        )
+        x = x["hidden_states"][self.feature_select_index][:, self.cls_idx :, :]
 
         return x
 
     def forward(self, x, attention_mask=None):
-        # vision-backbone
-        x = self.vit_forward(x)
-        x, attention_mask = self.sparsity(x)
-
-        # DEBUG
-        mask = x.mean(dim=-1).abs().detach().cpu() < 1e-03
-        self.p = mask.sum() / (mask.shape[0] * mask.shape[1])
+        # NOTE: need to rethink when variable number of crops exists per image
+        x = [self.vit_forward(x, p) for p in self.image_processors]
+        x = torch.cat(x, dim=1)  # to tensor
+        x = self.sparsity(x)
 
         if attention_mask is None:
             attention_mask = torch.ones(
@@ -167,33 +173,35 @@ class VisionTower(nn.Module):
 
 
 if __name__ == "__main__":
-    from ..beni import BeniConfig
     from .perceiver import PerceiverResamplerConfig
+    from .sparsity import DragonFlyConfig
     from transformers import SiglipVisionModel, SiglipImageProcessor
     import io
     from PIL import Image
     import requests
 
-    gumbel = sparsity.GumbelConfig(hidden_size=1152, temperature=0.1, p=0.3, lam=0.5)
+    vision_name_or_path = "google/siglip-so400m-patch14-384"
 
-    cfg = BeniConfig(
-        perceiver_config=None,
-        vision_name_or_path="google/siglip-so400m-patch14-384",
-        text_name_or_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        vision_cls="SiglipVisionModel",
-        vision_processor_cls="SiglipImageProcessor",
+    img_sizes = [224, 448]
+
+    cfg = VisionTowerConfig(
         r=1,
-        img_size=384,
-        sparsity_plugins=[gumbel],
+        use_cls=True,
+        img_sizes=img_sizes,
+        sparsity_plugins=[
+            DragonFlyConfig(
+                top_k=11,
+                num_patches=4,
+                img_sizes=img_sizes,
+                vit_stride=14,
+                use_cls=True,
+            )
+        ],
     )
 
-    vision = SiglipVisionModel.from_pretrained(cfg.vision_name_or_path)
-    processor = SiglipImageProcessor.from_pretrained(cfg.vision_name_or_path)
+    vision = SiglipVisionModel.from_pretrained(vision_name_or_path)
+    processor = SiglipImageProcessor.from_pretrained(vision_name_or_path)
     vt = VisionTower(vision, processor, cfg)
-
-    # load gumbel params from disk
-    path = "/home/nnethercott/beni/src/model_checkpoints/perceiver_test_p03/test-sparsitiy-step4389.pt"
-    vt.sparsity.load_state_dict(torch.load(path))
 
     img = Image.open(
         io.BytesIO(
@@ -203,32 +211,3 @@ if __name__ == "__main__":
         )
     ).convert("RGB")
     out = vt([img])
-
-    # get ids of zeroed tokens
-    mask = out.mean(dim=-1).abs() < 1e-03
-
-    from PIL import ImageDraw
-
-    img = img.resize((384, 384))  # match preprocessing
-    draw = ImageDraw.Draw(img)
-    h, w = img.size
-
-    ids = torch.arange(mask.shape[1]).unsqueeze(0).repeat((len(mask), 1))
-    ids = ids[mask].tolist()
-    num_patches = 384 // 14
-
-    # lower corners of the patch in question
-    xx, yy = torch.meshgrid(
-        14 * torch.tensor(range(num_patches)), 14 * torch.tensor(range(num_patches))
-    )  # might be an error here
-    patches = list(zip(xx.flatten().tolist(), yy.flatten().tolist()))
-
-    # todo: repeat patches so its the same len as bsz
-    patches = [patches[i] for i in ids]  # list of tensors
-
-    for patch in patches:
-        draw.rectangle((patch, (patch[0] + 14, patch[1] + 14)), "black")
-
-    img.save("./model/vision/test3.jpg")
-
-    # could do a histogram over different images to see distrbution

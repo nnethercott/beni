@@ -5,37 +5,22 @@ import time
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     ShardingStrategy,
-    CPUOffload,
-    BackwardPrefetch,
-    MixedPrecision,
     FullStateDictConfig,
     StateDictType,
-)
-from torch.distributed.fsdp.wrap import (
-    transformer_auto_wrap_policy,
-    size_based_auto_wrap_policy,
-    # enable_wrap,
-    # wrap,
 )
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from peft import LoraConfig, get_peft_model
 
 # local
 from d import *
-from policies.wrapping import fsdp_auto_wrap_policy, get_llama_wrapper
+from policies.wrapping import fsdp_auto_wrap_policy
 from utils.train_utils import clear_gpu_cache, setup_environ_flags
-
-from model import Beni
 
 
 # make this a constant
@@ -59,7 +44,7 @@ def cleanup():
 
 def fsdp_main(model_config, train_config, fsdp_config):
     rank = int(os.getenv("LOCAL_RANK"))
-    world_size = int(os.getenv("WORLD_SIZE"))
+    int(os.getenv("WORLD_SIZE"))
 
     # setup each cuda device ('device' aliased to cuda:n)
     if torch.distributed.is_initialized():
@@ -84,7 +69,7 @@ def fsdp_main(model_config, train_config, fsdp_config):
         with torch.device("meta"):
             model = AutoModelForCausalLM.from_config(config, attn_implementation="sdpa")
 
-    params = sum(p.numel() for p in model.parameters())
+    sum(p.numel() for p in model.parameters())
 
     # LORA
     # peft_config = LoraConfig(r=8, lora_alpha=32, target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'], bias = 'none')
@@ -166,7 +151,7 @@ def train(model, optimizer, dl, config):
                 optimizer.zero_grad()
 
             dt = time.time() - tik
-            shape = batch["input_ids"].shape
+            batch["input_ids"].shape
 
             if os.environ["LOCAL_RANK"] == "0":
                 print(

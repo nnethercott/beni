@@ -2,7 +2,6 @@
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement. = functools.partial(sft_collate_fn, tok=tok)
 
 
-from collections import Counter
 import os
 import functools
 from pprint import pprint
@@ -12,15 +11,13 @@ import random
 import torch
 import torch.optim as optim
 from peft import get_peft_model, PeftModel
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
 from torch.optim.lr_scheduler import StepLR
 from transformers import (
     AutoTokenizer,
-    BitsAndBytesConfig,
     AutoModelForCausalLM,
-    AutoConfig,
     HfArgumentParser,
 )
 
@@ -34,13 +31,8 @@ from configs import (
     lora_config,
     wandb_config,
 )
-from data.concatenator import ConcatDataset
 from policies import AnyPrecisionAdamW, apply_fsdp_checkpointing, fsdp_auto_wrap_policy
 
-from utils.config_utils import (
-    update_config,
-    generate_peft_config,
-)
 from utils.train_utils import (
     train,
     freeze_transformer_layers,
@@ -51,7 +43,6 @@ from utils.train_utils import (
     get_policies,
 )
 from accelerate.utils import is_xpu_available
-from warnings import warn
 
 from d import tiny_shakespeare, sft_collate_fn
 
@@ -105,7 +96,7 @@ def main(
         # torchrun env variables
         local_rank = int(os.environ["LOCAL_RANK"])
         rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
+        int(os.environ["WORLD_SIZE"])
 
     if torch.distributed.is_initialized():
         if is_xpu_available():
@@ -171,7 +162,7 @@ def main(
             model = PeftModel.from_pretrained(
                 model, train_config.from_peft_checkpoint, is_trainable=True
             )
-            peft_config = model.peft_config()
+            model.peft_config()
         # Generate the peft config and start fine-tuning from original model
         else:
             model = get_peft_model(model, lora_config)
