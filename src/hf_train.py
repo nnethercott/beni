@@ -29,7 +29,7 @@ from configs import WandbConfig
 from checkpointing import save_model
 from model import Beni, BeniConfig
 
-TOKEN = os.getenv("HF_ACCESS_TOKEN", None)
+TOKEN = os.getenv("HF_TOKEN", None)
 
 lora_config = LoraConfig(
     r=4,

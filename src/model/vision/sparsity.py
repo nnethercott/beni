@@ -1,7 +1,7 @@
-from dataclasses import dataclass
-from typing import Type
+from dataclasses import dataclass, field
+from typing import Type, Tuple
+import math
 
-import torch
 from torch import nn
 import torch.nn.functional as F
 
@@ -15,71 +15,39 @@ def sparsity_plugin(plugin_class: Type):
     return decorator
 
 
-class GumbelSoftmaxSparsityPlugin(nn.Module):
+# not trainable
+class BilinearInterpolationSparsityPlugin(nn.Module):
+    """
+    The gradients for the dtype float16 on CUDA may be inaccurate in the upsample operation when using modes ['linear', 'bilinear', 'bicubic', 'trilinear', 'area']. For more details, please refer to the discussion in issue #104157.
+    """
+
     def __init__(self, config):
         super().__init__()
-        # maybe replace this with param so we can do more fine-grained stuff like normalized dot product
+        self.size = config.size
 
-        # more complicated than basic linear
-        self.h = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size, bias=False),
-            nn.SiLU(),
-            nn.Linear(config.hidden_size, 2, bias=False),
-        )
-        self.temperature = config.temperature
-        self.prob = config.p
-        self.lam = config.lam
+    def forward(self, x):
+        assert len(x.shape) == 4
+        bsz, num_crops, seq_len, d = x.shape
 
-        self.losses = None
+        patch_h_w = int(math.sqrt(seq_len))
+
+        # flatten batch dim for interpolation
+        x = x.reshape(-1, d, patch_h_w, patch_h_w)  # [bsz x num_crops, d, h, w]
+
+        # mini-batch x channels x [optional depth] x [optional height] x width.
+        x = F.interpolate(x, size=self.size, mode="bilinear", align_corners=False)
+
+        # reshape to 3d tensor
+        x = x.view(bsz, num_crops, -1, d)
+
+        return x
 
     @classmethod
     def build(cls, config, **kwargs):
         return cls(config)
 
-    @staticmethod
-    def sample_gumbel(x):
-        u = torch.empty_like(x).uniform_(0, 1)
-        g = -torch.log(-torch.log(u))
-        return g
 
-    def register_loss(self, p, eps=1e-05):
-        """
-        batch mean over images
-        """
-        p = p.mean(dim=1)
-        # self.losses = self.lam*(1/self.prob - 1/(p+ 1e-05)).pow(2).mean()
-        x = p - self.prob
-        self.losses = self.lam * (x * F.tanh(6 * x)).mean()  # smooth-ish approx to abs
-        return
-
-    def forward(self, x):
-        """
-        TODO: when !self.train remove patches and make an attention_mask
-        """
-        logits = self.h(x)
-        g = GumbelSoftmaxSparsityPlugin.sample_gumbel(logits)
-        logits += g
-
-        # only keep the first storing P({event keep token x})
-        p = F.softmax(logits / self.temperature, dim=-1)
-        p = p[:, :, 0].unsqueeze(-1)
-
-        self.register_loss(1 - p)
-        return p * x, None
-
-
-# not trainable
-class BilinearInterpolationSparsityPlugin(nn.Module):
-    # llava-next
-    # F.interpolate(patches, size=size, mode="bilinear", align_corners=False)
-    pass
-
-
-@sparsity_plugin(GumbelSoftmaxSparsityPlugin)
-class GumbelConfig:
-    hidden_size: int
-    temperature: float = 0.1
-    p: float = 0.3
-    requires_grad: bool = True
-    lam: float = 1.0
-    trainable: bool = True
+@sparsity_plugin(BilinearInterpolationSparsityPlugin)
+class BilinearConfig:
+    size: Tuple[int, int] = field(default_factory=lambda: (27, 27))
+    trainable: bool = False

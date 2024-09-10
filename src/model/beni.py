@@ -426,11 +426,11 @@ if __name__ == "__main__":
     import io
     import requests
     from peft import PeftModel
-    from .vision import PerceiverResamplerConfig
+    from .vision import PerceiverResamplerConfig, BilinearConfig
 
     perceiver_config = PerceiverResamplerConfig(
         hidden_size=1152,  # from siglip.config
-        depth=1,
+        depth=3,
         n_latents=64,
         n_query_groups=1,
         n_heads=32,
@@ -444,8 +444,9 @@ if __name__ == "__main__":
         feature_select_index=-1,
         use_cls=True,
         img_size=384,
-        sparsity_plugins=None,
+        sparsity_plugins=[BilinearConfig(size=(6, 6))],
         perceiver_config=None,
+        grid=(2, 2),
     )
 
     model_config = BeniConfig(
@@ -456,35 +457,25 @@ if __name__ == "__main__":
         vision_processor_cls="SiglipImageProcessor",
         freeze=True,
         attn_implementation="eager",
+        bos_token="<s>",
+        instruction_template="<s>{instruction}</s>",
+        response_template="{response}</s>",
     )
 
-    # loading from checkpoint
-    # ckpt = "/mnt/nate/model_checkpoints/stablelm/step6039"
-    # with open(f"{'/'.join(ckpt.split('/')[:-1])}/model_config.json", "r") as f:
-    #     config_dict = json.loads(f.read())
-    #     model_config = BeniConfig.from_dict(config_dict)
+    # override
+    import json
+    from checkpointing import load_model
 
-    # inject quantization config ?
-    from transformers import BitsAndBytesConfig
-
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="fp4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=False,
-    )
-    model_config.llm_quantization_config = quantization_config
-    print(model_config)
+    with open("/mnt/nate/model_checkpoints/stablelm/model_config.json", "r") as f:
+        config_dict = json.loads(f.read())
+    model_config = BeniConfig.from_dict(config_dict)
 
     beni = Beni(model_config)
-    # beni.connector.load_state_dict(torch.load(f"{ckpt}/connector.pt"))
+    beni = load_model(
+        beni, "/mnt/nate/model_checkpoints/stablelm/step6039", trainable=False
+    )
     print(beni)
-
-    beni.to(torch.float16)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # device = "cpu"
-    print(f"putting on device: {device}")
     beni.to(device)
 
     inputs = {}
@@ -497,8 +488,8 @@ if __name__ == "__main__":
     ).convert("RGB")
     print(img)
 
-    # sentence = "provide a descriptive caption for this image"
-    sentence = ""
+    sentence = "provide a descriptive caption for this image"
+    # sentence = ""
 
     template = model_config.instruction_template
     inputs = beni.tokenizer(
@@ -506,8 +497,32 @@ if __name__ == "__main__":
         return_tensors="pt",
         add_special_tokens=False,
     )
-    # inputs['labels'] = inputs['input_ids']
+    inputs["labels"] = inputs["input_ids"]
     inputs["images"] = [img]
+
+    for k, v in inputs.items():
+        if isinstance(v, torch.Tensor):
+            inputs[k] = v.to(beni.device)
+
+    # out = beni(**inputs)
+    print("generating...")
+    out = beni.generate(
+        **inputs,
+        max_new_tokens=128,
+        # temperature=0.7,
+        # top_p=0.95,
+        num_beams=3,
+        num_return_sequences=1,
+        do_sample=False,
+        eos_token_id=[
+            beni.tokenizer.eos_token_id,
+            beni.tokenizer.pad_token_id,
+        ],
+    )
+    if "input_ids" in inputs.keys():
+        print(beni.tokenizer.batch_decode(inputs["input_ids"]))
+
+    print(beni.tokenizer.batch_decode(out))
 
     # from data import load_recap, sft_collate_fn
     # import functools
@@ -529,27 +544,3 @@ if __name__ == "__main__":
     #         )
     #     )
     # )
-
-    for k, v in inputs.items():
-        if isinstance(v, torch.Tensor):
-            inputs[k] = v.to(beni.device)
-
-    out = beni(**inputs)
-    # print("generating...")
-    # out = beni.generate(
-    #     **inputs,
-    #     max_new_tokens=128,
-    #     # temperature=0.7,
-    #     # top_p=0.95,
-    #     num_beams=3,
-    #     num_return_sequences=1,
-    #     do_sample=False,
-    #     eos_token_id=[
-    #         beni.tokenizer.eos_token_id,
-    #         beni.tokenizer.pad_token_id,
-    #     ],
-    # )
-    # if "input_ids" in inputs.keys():
-    #     print(beni.tokenizer.batch_decode(inputs["input_ids"]))
-
-    # print(beni.tokenizer.batch_decode(out))

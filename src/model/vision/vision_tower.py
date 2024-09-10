@@ -1,54 +1,73 @@
-from dataclasses import dataclass
-from typing import Callable, Optional, List, Union
-
+from dataclasses import dataclass, field
+from typing import Optional, List, Union, Any, Tuple
 from collections import OrderedDict
 from PIL import Image
-
+import numpy as np
 import torch
 from torch import nn
 
 from transformers import (
-    PreTrainedModel,
     SiglipVisionModel,
+    BaseImageProcessor,
+    CLIPVisionModel,
 )
 
 from .perceiver import PerceiverResampler, PerceiverResamplerConfig
 from . import sparsity
 
 
+def grid_based_crop(img: Image.Image, grid: Tuple[int, int]):
+    w, h = img.size
+    crops = []
+    dw, dh = w / grid[0], h / grid[1]
+
+    for i in range(grid[0]):
+        for j in range(grid[1]):
+            box = (dw * i, dh * j, dw * (i + 1), dh * (j + 1))
+            crops.append(img.crop(box))
+    return crops
+
+
+# maybe faster
+def grid_based_crop_numpy(img: Image.Image, grid: Tuple[int, int]):
+    img_np = np.array(img)
+    h, w, _ = img_np.shape
+    dw, dh = w // grid[0], h // grid[1]
+    crops = [img]
+
+    for i in range(grid[0]):
+        for j in range(grid[1]):
+            # numpy slicing
+            crop = img_np[dh * j : dh * (j + 1), dw * i : dw * (i + 1), :]
+            crops.append(Image.fromarray(crop))
+    return crops
+
+
 @dataclass
 class VisionTowerConfig:
     r: int = 1
     img_size: int = 384
-    # image_processors: Optional{AutoProcessor] for grid cropping etc
     use_cls: bool = False
     feature_select_index: int = -1
     perceiver_config: Optional[PerceiverResamplerConfig] = None
-    sparsity_plugins: Optional[
-        List[Union[sparsity.DragonFlyConfig, sparsity.GumbelConfig]]
-    ] = None
+    sparsity_plugins: Optional[List[Any]] = None
+
+    # in the future make this take grid patterns
+    grid: Tuple[int, int] = field(default_factory=lambda: (1, 1))
 
 
 class VisionTower(nn.Module):
-    """
-    todo:
-        - add feature select index
-        - trainable token pool ?
-        - do we want the [cls] token as well?
-            - **only applies to some models!"
-    """
-
     def __init__(
         self,
-        vision: PreTrainedModel,
-        processor: Callable[[Image], torch.Tensor],
+        vision: Union[SiglipVisionModel, CLIPVisionModel],
+        processor: BaseImageProcessor,
         config: VisionTowerConfig,
     ):
-        # HERE WE ASSUME ONLY THE VISION MODEL IS PASSED. WE WILL SUBCLASS LATER WHEN USING TEXT
         super().__init__()
         self.feature_select_index = config.feature_select_index  # add to config
         self.cls_idx = 0 if config.use_cls else 1
         self.r = config.r
+        self.grid = config.grid
 
         # for clip/siglip models
         self.vision = vision
@@ -59,7 +78,7 @@ class VisionTower(nn.Module):
         )
 
         # image processors
-        self.image_processor = self.get_image_processors(processor, config.img_size)
+        self.image_processor = self.get_image_processor(processor, config.img_size)
 
         # perceiver resampler
         if config.perceiver_config is not None:
@@ -92,7 +111,9 @@ class VisionTower(nn.Module):
         assert len(dtypes) == 1
         return list(dtypes)[0]
 
-    def get_image_processors(self, processor, img_size: int):
+    def get_image_processor(
+        self, processor, img_size: int
+    ):  # might need to rework later
         self.is_high_res = img_size != processor.size
 
         if isinstance(processor.size, dict):
@@ -115,17 +136,22 @@ class VisionTower(nn.Module):
         self, embeddings: torch.Tensor, height: int, width: int
     ):
         """
-        TODO: for clip models
+        TODO: implement this for clip-based
         """
         raise NotImplementedError
 
-    def vit_forward(self, x):
-        try:
-            x = self.image_processor(x, return_tensors="pt")["pixel_values"]  # type: ignore
-        except:
-            # debug (sometimes we get single channel images)
-            print(x)
-            raise RuntimeError
+    def pre_forward(self, x: List[Image.Image]) -> List[Image.Image]:
+        # TODO: aspect ratio-grid cropping
+        if self.grid == (1, 1):
+            return x
+
+        crops = (grid_based_crop_numpy(img, self.grid) for img in x)  # type: ignore
+
+        return [img for c in crops for img in c]  # flatten
+
+    @torch.no_grad()
+    def vit_forward(self, x: List[Image.Image]) -> torch.FloatTensor:
+        x = self.image_processor(x, return_tensors="pt")["pixel_values"]
 
         fwd_kwargs = {}
         if self.is_high_res:
@@ -136,15 +162,28 @@ class VisionTower(nn.Module):
             fwd_kwargs["interpolate_pos_encoding"] = True
 
         x = self.vision(
-            x.to(self.device, self.torch_dtype), output_hidden_states=True, **fwd_kwargs
+            x.to(self.device, self.torch_dtype),  # type: ignore
+            output_hidden_states=True,
+            **fwd_kwargs,
         )
-        x = x["hidden_states"][self.feature_select_index][:, self.cls_idx :, :]
+        x = x["hidden_states"][self.feature_select_index][:, self.cls_idx :, :]  # type: ignore
 
-        return x
+        # reshape tensor using self.grid
+        a, b = self.grid
+        i = 0 if a == 1 and b == 1 else 1  # no additional global img crop if grid (1,1)
+        x = x.view(-1, a * b + i, *x.shape[-2:])  # type: ignore
 
+        return x  # type: ignore
+
+    @torch.no_grad()
     def forward(self, x, attention_mask=None):
+        x = self.pre_forward(x)
         x = self.vit_forward(x)
         x = self.sparsity(x)
+
+        # flatten 4d->3d [bsz, num_crops, seq_len, d] -> [bsz, num_crops x seq_len, d]
+        bsz, _, _, d = x.shape
+        x = x.reshape(bsz, -1, d)
 
         if attention_mask is None:
             attention_mask = torch.ones(
@@ -152,14 +191,13 @@ class VisionTower(nn.Module):
             )
 
         x = self.resampler(x, attention_mask)
-        b, s, _ = x.shape
+        b, s = x.shape[:2]
 
         # concatenate adjacent tokens a la minigpt4-v2
         return x.reshape((b, s // self.r, -1))
 
 
 if __name__ == "__main__":
-    from .perceiver import PerceiverResamplerConfig
     from transformers import SiglipVisionModel, SiglipImageProcessor
     import io
     from PIL import Image
@@ -169,11 +207,18 @@ if __name__ == "__main__":
 
     img_size = 384
 
-    cfg = VisionTowerConfig(r=1, use_cls=True, img_size=img_size, sparsity_plugins=None)
+    cfg = VisionTowerConfig(
+        r=1,
+        use_cls=True,
+        img_size=img_size,
+        sparsity_plugins=[sparsity.BilinearConfig(size=(14, 14))],
+        grid=(1, 1),
+    )
 
     vision = SiglipVisionModel.from_pretrained(vision_name_or_path)
+
     processor = SiglipImageProcessor.from_pretrained(vision_name_or_path)
-    vt = VisionTower(vision, processor, cfg)
+    vt = VisionTower(vision, processor, cfg).to("cuda")  # type: ignore
 
     img = Image.open(
         io.BytesIO(
@@ -183,4 +228,24 @@ if __name__ == "__main__":
         )
     ).convert("RGB")
 
-    out = vt([img])
+    out = vt([img] * 10)
+
+    # def timing(f):
+    #     def wrap(*args, **kwargs):
+    #         now = time.time()
+    #         res = f(*args, **kwargs)
+    #         later = time.time()
+    #         print(f"{f.__name__}: {later - now:.4f}")
+    #         return res
+
+    #     return wrap
+
+    # @timing
+    # def dummy(x):
+    #     out = vt([img] * x)
+    #     out.cpu()
+    #     del out
+    #     torch.cuda.empty_cache()
+
+    # for i in [1, 3, 5, 8, 10]:
+    #     dummy(i)

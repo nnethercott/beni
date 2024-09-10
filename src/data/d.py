@@ -8,6 +8,7 @@ import torch
 
 NUM_IMG_TOKENS = 96
 MAX_LEN = 224
+TOKEN = os.getenv("HF_TOKEN")
 
 """
 Available dataset loaders:
@@ -65,7 +66,7 @@ def load_recap(
         "UCSC-VLAA/Recap-DataComp-1B",
         split=split,
         streaming=True,
-        token=os.environ["HF_ACCESS_TOKEN"],
+        token=TOKEN,
     )
 
     data = data.rename_columns({"re_caption": "response"})
@@ -111,7 +112,7 @@ def load_allava_laion(
         "allava_laion",
         split=split,
         streaming=True,
-        token=os.environ["HF_ACCESS_TOKEN"],
+        token=TOKEN,
     )
 
     # load n
@@ -155,7 +156,7 @@ def load_allava_text(
         "FreedomIntelligence/ALLaVA-4V",
         split=split,
         streaming=True,
-        token=os.environ["HF_ACCESS_TOKEN"],
+        token=TOKEN,
     )
 
     # load n

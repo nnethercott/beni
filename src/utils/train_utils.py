@@ -73,19 +73,6 @@ def profile(cfg, local_rank=None):
         yield None
 
 
-def freeze_transformer_layers(model, num_layer):
-    for i, layer in enumerate(model.model.layers):
-        if i < num_layer:
-            for param in layer.parameters():
-                param.requires_grad = False
-
-
-def check_frozen_layers_peft_model(model):
-    for i, layer in enumerate(model.base_model.model.model.layers):
-        for name, param in layer.named_parameters():
-            print(f"Layer {i}, parameter {name}: requires_grad = {param.requires_grad}")
-
-
 def setup():
     """Initialize the process group for distributed training"""
     if is_ccl_available():

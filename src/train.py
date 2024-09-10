@@ -16,14 +16,14 @@ from torch.distributed.fsdp import (
 )
 
 # fsdp layers
-from transformers.models.stablelm.modeling_stablelm import StableLmDecoderLayer
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_constant_schedule_with_warmup
 
 from peft import get_peft_model
 
 # local
-from model.vision import VisionTower, VisionTowerConfig
+from model.vision import VisionTower, VisionTowerConfig, BilinearConfig
 from data import (
     MinHashLSHDeduplicator,
     load_recap,
@@ -42,7 +42,7 @@ from checkpointing import save_model, load_model
 
 from model import Beni, BeniConfig
 
-TOKEN = os.getenv("HF_ACCESS_TOKEN", None)
+TOKEN = os.getenv("HF_TOKEN", None)
 
 
 def seed_everything(seed=0):
@@ -97,7 +97,7 @@ def get_dataloader(tokenizer, model_config, train_config):
     print("loading recap...")
     recap = load_recap(
         tokenizer,
-        n=100000,
+        n=200000,
         instruction_template=instruction_template,
         response_template=response_template,
     )
@@ -252,19 +252,43 @@ def fsdp_main(model_config, **kwargs):
     # data
     dl = get_dataloader(model.tokenizer, model.config, train_config)
 
-    # optimizer
+    # optimizer and scheduler
+    optimizer_parameter_groups = [
+        {
+            "params": [p for p in model.connector.parameters()],
+            "weight_decay": train_config.weight_decay,
+            "lr": train_config.mm_connector_lr,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "connector" not in n],
+            "weight_decay": train_config.weight_decay,
+            "lr": train_config.llm_lr,
+        },
+    ]
+
     optimizer = torch.optim.AdamW(  # type: ignore
-        model.parameters(),
-        lr=train_config.lr,
+        optimizer_parameter_groups,
         weight_decay=train_config.weight_decay,
         betas=train_config.betas,
     )
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        int(train_config.warmup_ratio * len(dl) * train_config.n_epochs),
-        len(dl) * train_config.n_epochs,
-        min_lr=train_config.min_lr,
-    )
+
+    if train_config.scheduler == "cosine_with_warmup":
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            int(train_config.warmup_ratio * len(dl) * train_config.n_epochs),
+            len(dl) * train_config.n_epochs,
+            min_lr=train_config.min_lr,
+        )
+    elif train_config.scheduler == "constant_with_warmup":
+        scheduler = get_constant_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(
+                train_config.warmup_ratio * len(dl) * train_config.n_epochs
+            ),
+            last_epoch=-1,
+        )
+    else:
+        pass
 
     # launch train
     train(model, optimizer, scheduler, dl, train_config, wandb_run=wandb_run)
@@ -348,52 +372,31 @@ def train(model, optimizer, scheduler, dl, train_config, wandb_run=None):
 
 if __name__ == "__main__":
     setup()
-    # perceiver_config = PerceiverResamplerConfig(
-    #    hidden_size=1152,  # from siglip.config
-    #    depth=1,
-    #    n_latents=64,
-    #    n_query_groups=1,
-    #    n_heads=32,
-    #    head_dim=64,
-    #    concat_latents_kv=False,
-    #    attention_dropout=0.1,
-    # )
-
-    # img_sizes = [392, 672]  # vs 504
-
     vision_tower_config = VisionTowerConfig(
-        r=8,
-        feature_select_index=-1,  # think llava does this
-        use_cls=False,
-        img_sizes=384,
-        # sparsity_plugins=[
-        #     DragonFlyConfig(
-        #         top_k=144,
-        #         img_sizes=img_sizes,
-        #         num_patches=4,
-        #         vit_stride=14,
-        #         use_cls=True,
-        #     )
-        # ],
-        sparsity_plugins=None,
+        r=10,
+        feature_select_index=-2,
+        use_cls=True,
+        img_size=384,
+        grid=(2, 2),  # 2x2 + 1 crops
+        sparsity_plugins=[BilinearConfig(size=(16, 16))],
         perceiver_config=None,
     )
 
     model_config = BeniConfig(
         vision_name_or_path="google/siglip-so400m-patch14-384",
-        # text_name_or_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        text_name_or_path="stabilityai/stablelm-2-1_6b-chat",
+        text_name_or_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # text_name_or_path="stabilityai/stablelm-2-1_6b-chat",
         vision_tower_config=vision_tower_config,
         vision_cls="SiglipVisionModel",
         vision_processor_cls="SiglipImageProcessor",
         freeze=True,
         attn_implementation="eager",
-        bos_token="<|user|>\n",  # offset needed for img token insert
-        instruction_template="<|user|>\n{instruction}<|endoftext|>\n<|assistant|>\n",  # no loss part
-        response_template="{response}<|endoftext|>\n",  # loss part
-        # bos_token="<s><|user|>",
-        # instruction_template="<s><|user|>\n{instruction}</s>\n<|assistant|>\n",
-        # response_template="{response}</s>",
+        # bos_token="<|user|>\n",  # offset needed for img token insert
+        # instruction_template="<|user|>\n{instruction}<|endoftext|>\n<|assistant|>\n",  # no loss part
+        # response_template="{response}<|endoftext|>\n",  # loss part
+        bos_token="<|user|>",
+        instruction_template="<|user|>\n{instruction}</s>\n<|assistant|>\n",
+        response_template="{response}</s>",
         # llm_quantization_config = BitsAndBytesConfig(
         #    load_in_4bit = True,
         #    bnb_4bit_compute_dtype=torch.float16,
@@ -406,15 +409,16 @@ if __name__ == "__main__":
         warmup_ratio=0.03,
         batch_size=4,
         gradient_accumulation_steps=4,
-        lr=5e-04,
+        mm_connector_lr=3e-04,
         weight_decay=0.1,
-        min_lr=2.5e-04,
+        min_lr=4e-05,
         grad_clip=1.0,
         save_steps=1000,
-        log_steps=2,
+        log_steps=1,
         ckpt_path=None,
-        save_path="/mnt/nate/model_checkpoints/stablelm",
+        save_path="/mnt/nate/model_checkpoints/grid_2x2",
         betas=[0.9, 0.95],
+        scheduler="constant_with_warmup",
         fsdp=True,
         enable_peft=False,
     )
@@ -422,8 +426,8 @@ if __name__ == "__main__":
     # need this for weight tying: torch.nn.Embedding, # if we upscale images we can't fsdp the positional embeddings ?
     fsdp_config = FSDPConfig(
         transformer_cls=(
-            # LlamaDecoderLayer,
-            StableLmDecoderLayer,
+            LlamaDecoderLayer,
+            # StableLmDecoderLayer,
             SiglipEncoderLayer,
             # PerceiverResampler,
             # nn.Embedding,

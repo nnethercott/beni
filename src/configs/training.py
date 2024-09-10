@@ -15,9 +15,11 @@ class TrainConfig:
     log_steps: int = 1
     grad_clip: Optional[float] = 1.0
     weight_decay: float = 0.0
-    lr: float = 1e-04
+    mm_connector_lr: float = 1e-05
+    llm_lr: float = 1e-04
     min_lr: float = 1e-05
-    betas: List = (field(default_factory=lambda: [0.9, 0.999]),)
+    betas: List = field(default_factory=lambda: [0.9, 0.999])
+    scheduler: str = "cosine_with_warmup"
     ckpt_path: Optional[str] = None
     save_path: Optional[str] = None
     fsdp: bool = True
