@@ -27,7 +27,8 @@
 * [x] multi dataloader and length-ordered datasets for optimized training [11/08/24]
 * [ ] cross-attention vlm archi 
 * [x] support generic propmt templates in dataset module & model forward [26/08/24]
-* [ ] alt quantization schemes (e.g. HQQ) 
+* [x] alt quantization schemes (e.g. HQQ) 
+    * natively supported now by huggingface
 * [x] DLoRA 
 * [x] perceiver resampler [14/08/24]
     * either use the idefics2 one or we use our own implementation (test both) 
@@ -48,6 +49,10 @@
     * use transformers activation map 
 * [ ] use meta's memory trace tool to get max cuda memory allocated and reallocations, etc
 * [x] quantized generation [09/09/24] 
+* [ ] post-training optimization 
+    * torch jit compile, quantization, pruning, etc 
+    * some starting points in this repo: [mervenoyan/smol-vision](https://github.com/merveenoyan/smol-vision), otherwise check out [torch docs](https://pytorch.org/tutorials/intermediate/torch_compile_tutorial.html)
+* [ ] enable eval on benchmarks like [OCRBench](https://github.com/Yuliang-Liu/MultimodalOCR) using custom deepo vlm
 
 # Usage
 Training is configured parametrically using various config objects which get passed to a launch script. These configs allow for defining optional model components (e.g. the `PerceiverResamplerConfig`) and control aspects like model architecture and training hyperparameters.
@@ -132,6 +137,7 @@ We mainly use the hugging face API in this project which assumes models have spe
 ## fsdp gotchas
 * transformers are made up of sequential blocks with residual connections. if we shard model parameters between gpus then a tensor op like $x+f(x)$ where `x.device=cuda:0` and `f(x).device=cuda:1` may break training. To resolve this we specify which layers to wrap in the fsdp config.  
     * if fine tuning an llm which has weight tying activated (`lm_head` = `embed_tokens`) then the embedding weights might simultaneously be needed to convert tokens to embeddings or hidden states to logits. this poses a race condition which breaks training. Solution in this case is to wrap the `nn.Embedding` layer in a fsdp module. 
+        * in this case we need only wrap `nn.Embedding` and not the VisionTower
 * a multimodal training dataset consisting of both image-text pairs and just text samples will activate different parts of the network. the `model.connector` has no gradients when pure text is used. thus the gradient all reduce in fsdp will break since we're trying to average out tensors between gpus which may not exist on others
     * the `data.utils.MultiLoader` was created to solve this (ensures each devices sees the same modality per iteration)
 * original code for the training loop looked like:

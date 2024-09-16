@@ -22,6 +22,7 @@
     * [NOTE] could use feature upscaler like [FeatUp](https://mhamilton.net/featup.html)  to uspcale images before crops ?
     * upscaling image resolution significantly increases training time without improving perf when using AnyRes
         * for single crop models inc. imagre res is beneficial though 
+        * although higher res without modifying #tokens improves OCR
     * bilinear interpolation better than pooling 
         * could ablate which interplation strategy is best
     * [NOTE] llava-next uses dynamic grids depending on image aspect ratio; for a v1 we'll just stick with a 2x2 grid

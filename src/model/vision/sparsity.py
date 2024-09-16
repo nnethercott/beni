@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Type, Tuple
+from typing import Type, Tuple, Union, List
 import math
 
 from torch import nn
@@ -49,5 +49,5 @@ class BilinearInterpolationSparsityPlugin(nn.Module):
 
 @sparsity_plugin(BilinearInterpolationSparsityPlugin)
 class BilinearConfig:
-    size: Tuple[int, int] = field(default_factory=lambda: (27, 27))
+    size: Union[Tuple[int, int], List[int]] = field(default_factory=lambda: (27, 27))
     trainable: bool = False

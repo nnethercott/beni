@@ -4,12 +4,43 @@ from torch.utils.data import Dataset
 import os
 import random
 from urllib.parse import urlparse
+from transformers import AutoTokenizer
 
 import requests
 from PIL import Image
 import io
 
-from .minhash import *
+
+from .minhash import MinHashLSHDeduplicator
+
+
+def fuzzy_filter(*datasets, tokenizer: AutoTokenizer):
+    """
+    use dataset.data so we avoid loading images
+    """
+    datasets = list(datasets)
+
+    # for some reason dataset.Dataset.to_list() converts pil images to bytes so we need
+    # to update the CustomDataset.data attribute AFTER creation
+
+    text_only = []
+    for d in datasets:
+        if isinstance(d.data, dict):
+            d.data = [dict(zip(d.data, t)) for t in zip(*d.data.values())]
+        text_only.append([item["response"] for item in d.data])
+
+    # fuzzy deduplication with minhash
+    minhash = MinHashLSHDeduplicator(tokenizer, *text_only)
+    duplicate_ids = minhash.deduplicate(jaccard_sim=0.85, num_perm=128)
+
+    print(f"{len(duplicate_ids)} duplicates detected!\nremoving them now...")
+
+    # clean original datasets
+    for e, id_list in enumerate(duplicate_ids):
+        for idx in id_list[::-1]:
+            _ = datasets[e].data.pop(idx)
+
+    return datasets
 
 
 # torch.utils.data.Dataset subclass
@@ -65,28 +96,60 @@ class LazyCustomDatasetForImages(CustomDataset):
         return {**sample, "images": img}
 
 
-# can use this for diverse batch sizes in normal dataset ordered by context length too
-# can nest these as well
-class MultiDataLoader:
+class StreamingDataset(Dataset):
     """
-    random sample between several dataloaders, allowing for multimodality training
+    torch.DataLoader-like
     """
 
-    def __init__(self, *loaders, **kwargs):
-        self.loaders = list(loaders)
+    def __init__(
+        self, data, batch_size: int, n: int, skip: int = 0, collate_fn=None
+    ) -> None:
+        self.data_iter = data.skip(skip).take(n).iter(batch_size)
+        self.index = 0
+        self.n = n
+        self.batch_size = batch_size
+        self.collate_fn = collate_fn
+
+    def __len__(self):
+        indicator = 1 if self.n % self.batch_size > 0 else 0
+        return self.n // self.batch_size + indicator
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.index < self.n:
+            self.index += 1
+            batch = next(iter(self.data_iter))
+
+            if self.collate_fn is not None:
+                batch = self.collate_fn(batch)
+
+            return batch
+        else:
+            raise StopIteration
+
+
+class MultiDataLoader:
+    """
+    Randomly sample between several data loaders, allowing for multimodality training.
+    """
+
+    def __init__(self, *loaders, **kwargs) -> None:
+        self.loaders = list(loaders)  # Current loaders in use (modifiable)
         self.loader_iters = [iter(loader) for loader in self.loaders]
         self.loader_lens = [len(loader) for loader in self.loaders]
         self.buffer = list(range(len(self.loaders)))
         self.weights = [l / sum(self.loader_lens) for l in self.loader_lens]
 
-        # hacky
+        # Seeding for deterministic behavior
         seed = kwargs.get("seed", None)
         if seed:
             self.sampler = random.Random(seed)
         else:
             self.sampler = None
 
-    def __len__(self):
+    def __len__(self) -> int:
         return sum(self.loader_lens)
 
     def __iter__(self):
@@ -106,19 +169,19 @@ class MultiDataLoader:
             self.loader_lens[idx] -= 1
 
             if self.loader_lens[idx] == 0:
-                # remove data loader
+                # Remove exhausted data loader
                 self.buffer.pop(idx)
                 self.loader_iters.pop(idx)
                 self.loader_lens.pop(idx)
                 self.weights.pop(idx)
 
-                # fix buffer indices
+                # Recalculate buffer indices
                 self.buffer = list(range(len(self.loader_iters)))
 
             return batch
 
         except StopIteration:
-            # should be gone already, but if there remove it and attempt to fetch from another loader
+            # If a loader is exhausted in between, remove it and fetch from another loader
             self.buffer.remove(idx)
             return self.__next__()
 
@@ -127,11 +190,17 @@ def sft_collate_fn(inputs, tok):
     """
     dynamically pads input tensors and constructs attn mask
     """
-    # print(inputs)
-    # remove samples which we couldn't download image for
-    bad_ids = [
-        i for i, sample in enumerate(inputs) if sample.get("images", True) is None
-    ]
+    # sometimes a slice is a DL instead of LD
+    if isinstance(inputs, dict):
+        inputs = [dict(zip(inputs, t)) for t in zip(*inputs.values())]
+
+    # check for bad images
+    bad_ids = []
+    for i, sample in enumerate(inputs):
+        image = sample.get("images", True)
+        if image is None or len(image.size) != 2 or image.size[:2] == (1, 1):
+            bad_ids.append(i)
+
     bad_ids = bad_ids[::-1]
     for i in bad_ids:
         inputs.pop(i)

@@ -311,9 +311,7 @@ class Beni(nn.Module):
 
             # if we're computing loss
             if labels is not None:
-                labels = labels[
-                    :, 1:
-                ]  # need to get rid of <s> since we're about to concatenate a prefix with img tokens
+                labels = labels[:, 1:]
                 additional_len += 1  # <s> we just got rid of^
                 labels_prefix = torch.tensor(
                     [-100] * (vis_len + additional_len), device=self.device
@@ -466,14 +464,12 @@ if __name__ == "__main__":
     import json
     from checkpointing import load_model
 
-    with open("/mnt/nate/model_checkpoints/stablelm/model_config.json", "r") as f:
+    with open("/mnt/nate/model_checkpoints/ref/model_config.json", "r") as f:
         config_dict = json.loads(f.read())
     model_config = BeniConfig.from_dict(config_dict)
 
     beni = Beni(model_config)
-    beni = load_model(
-        beni, "/mnt/nate/model_checkpoints/stablelm/step6039", trainable=False
-    )
+    beni = load_model(beni, "/mnt/nate/model_checkpoints/ref/", trainable=False)
     print(beni)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     beni.to(device)

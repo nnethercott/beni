@@ -12,6 +12,8 @@ class TrainConfig:
     batch_size: int = 16
     gradient_accumulation_steps: int = 1
     save_steps: int = 100
+    eval_steps: Optional[int] = None
+    do_eval: bool = False
     log_steps: int = 1
     grad_clip: Optional[float] = 1.0
     weight_decay: float = 0.0

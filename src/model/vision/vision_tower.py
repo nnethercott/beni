@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, List, Union, Any, Tuple
+from typing import Optional, List, Union, Tuple
 from collections import OrderedDict
 from PIL import Image
 import numpy as np
@@ -50,10 +50,12 @@ class VisionTowerConfig:
     use_cls: bool = False
     feature_select_index: int = -1
     perceiver_config: Optional[PerceiverResamplerConfig] = None
-    sparsity_plugins: Optional[List[Any]] = None
+    sparsity_plugins: Optional[List[sparsity.BilinearConfig]] = None
 
     # in the future make this take grid patterns
-    grid: Tuple[int, int] = field(default_factory=lambda: (1, 1))
+    grid: Union[List[int], Tuple[int, int]] = field(
+        default_factory=lambda: (1, 1)
+    )  # json stores tuples as list
 
 
 class VisionTower(nn.Module):
@@ -67,7 +69,7 @@ class VisionTower(nn.Module):
         self.feature_select_index = config.feature_select_index  # add to config
         self.cls_idx = 0 if config.use_cls else 1
         self.r = config.r
-        self.grid = config.grid
+        self.grid = tuple(config.grid)
 
         # for clip/siglip models
         self.vision = vision
@@ -154,12 +156,12 @@ class VisionTower(nn.Module):
         x = self.image_processor(x, return_tensors="pt")["pixel_values"]
 
         fwd_kwargs = {}
-        if self.is_high_res:
-            if not isinstance(self.vision, (SiglipVisionModel,)):
-                raise RuntimeError(
-                    "Trying to upscale images to size {self.vision.config.size} without known `interpolate_pos_encodings` impl in model forward"
-                )
-            fwd_kwargs["interpolate_pos_encoding"] = True
+        # if self.is_high_res:
+        #     if not isinstance(self.vision, (SiglipVisionModel,)):
+        #         raise RuntimeError(
+        #             "Trying to upscale images to size {self.vision.config.size} without known `interpolate_pos_encodings` impl in model forward"
+        #         )
+        #     fwd_kwargs["interpolate_pos_encoding"] = True
 
         x = self.vision(
             x.to(self.device, self.torch_dtype),  # type: ignore
@@ -208,10 +210,10 @@ if __name__ == "__main__":
     img_size = 384
 
     cfg = VisionTowerConfig(
-        r=1,
+        r=9,
         use_cls=True,
         img_size=img_size,
-        sparsity_plugins=[sparsity.BilinearConfig(size=(14, 14))],
+        # sparsity_plugins=[sparsity.BilinearConfig(size=(27, 27))],
         grid=(1, 1),
     )
 
@@ -228,7 +230,7 @@ if __name__ == "__main__":
         )
     ).convert("RGB")
 
-    out = vt([img] * 10)
+    out = vt([img])
 
     # def timing(f):
     #     def wrap(*args, **kwargs):

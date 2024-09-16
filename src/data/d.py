@@ -1,4 +1,9 @@
-from .utils import CustomDataset, LazyCustomDatasetForImages, apply_chat_template
+from .utils import (
+    CustomDataset,
+    LazyCustomDatasetForImages,
+    apply_chat_template,
+    StreamingDataset,
+)
 import functools
 import datasets
 import re
@@ -7,7 +12,7 @@ import json
 import torch
 
 NUM_IMG_TOKENS = 96
-MAX_LEN = 224
+MAX_LEN = 384
 TOKEN = os.getenv("HF_TOKEN")
 
 """
@@ -141,6 +146,7 @@ def load_allava_laion(
     data = apply_chat_template(
         data,
         tok,
+        truncate=True,
         ctx_len=MAX_LEN - NUM_IMG_TOKENS,
         instruction_template=instruction_template,
         response_template=response_template,
@@ -182,6 +188,7 @@ def load_allava_text(
     data = apply_chat_template(
         data,
         tok,
+        truncate=True,
         ctx_len=MAX_LEN,
         instruction_template=instruction_template,
         response_template=response_template,
@@ -210,7 +217,7 @@ def load_synthdog(
                 samples["ground_truth"],
             )
         )
-        # prompts = ["read the text in this image."] * len(responses)
+        prompts = ["read the text in this image."] * len(responses)
         prompts = [""] * len(responses)
 
         samples["response"] = responses
@@ -232,7 +239,9 @@ def load_synthdog(
     )
 
     # comes with images by default
-    return CustomDataset(data)
+    data = CustomDataset(data)
+    data.data = [dict(zip(data.data, t)) for t in zip(*data.data.values())]
+    return data
 
 
 def load_textocr(
@@ -274,7 +283,7 @@ def load_gpt4v_long(
 ):
     data = datasets.load_dataset(
         "laion/gpt4v-dataset",
-        split=split,
+        split=f"{split}[:{n}]",
     )
 
     # preprocess
@@ -288,6 +297,7 @@ def load_gpt4v_long(
     data = apply_chat_template(
         data,
         tok,
+        truncate=True,
         ctx_len=MAX_LEN - NUM_IMG_TOKENS,
         instruction_template=instruction_template,
         response_template=response_template,
@@ -331,10 +341,45 @@ def load_gpt4v_short(
     return LazyCustomDatasetForImages(data)
 
 
+def load_lmms_lab_recap(tok, instruction_template=None, response_template=None):
+    data = datasets.load_dataset(
+        "lmms-lab/LLaVA-ReCap-558K", split="train", streaming=True
+    )
+
+    # lazy map
+    def preprocess(samples):
+        samples["prompt"] = [""] * len(samples["conversations"])
+        samples["response"] = [c[1]["value"] for c in samples["conversations"]]
+        samples["image"] = [image.convert("RGB") for image in samples["image"]]
+        return samples
+
+    data = data.map(preprocess, batched=True)
+    data = data.rename_columns({"image": "images"})
+
+    # hoping this is lazy
+    data = apply_chat_template(
+        data,
+        tok,
+        truncate=True,
+        ctx_len=MAX_LEN - NUM_IMG_TOKENS,
+        instruction_template=instruction_template,
+        response_template=response_template,
+    )
+
+    return data
+
+
 if __name__ == "__main__":
     from transformers import AutoTokenizer
+    from .utils import sft_collate_fn
 
     tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-360M-Instruct")
 
     # syn = load_synthdog(tok, n=100)
-    ocr = load_textocr(tok, "/mnt/nate/datasets/textocr/train_images/", n=100)
+    # ocr = load_textocr(tok, "/mnt/nate/datasets/textocr/train_images/", n=100)
+
+    data = load_lmms_lab_recap(tok)
+    data = StreamingDataset(
+        data, n=100, batch_size=4, collate_fn=functools.partial(sft_collate_fn, tok=tok)
+    )
+    batch = next(data)
