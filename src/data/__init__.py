@@ -109,7 +109,8 @@ def get_train_dataloader(tokenizer, model_config, train_config):
     # dataloader-like
     data = StreamingDataset(
         data,
-        n=100000,
+        n=500000,
+        skip=100000 + 8 * 18000,
         batch_size=train_config.batch_size,
         collate_fn=functools.partial(sft_collate_fn, tok=tokenizer),
     )

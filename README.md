@@ -157,3 +157,6 @@ the issue with this is that if we skip a batch one rank may encounter the `save_
 * [invalid device ordinal](https://stackoverflow.com/questions/64334033/how-to-solve-runtimeerror-cuda-error-invalid-device-ordinal) might occur if you hard set `CUDA_VISIBLE_DEVICES` manually ?
 
 
+
+## Best Practices
+* if the model can fit on a single GPU use `ShardingStrategy.NO_SHARD` (equivalent to DDP). otherwise try `ShardingStrategy.SHARD_GRAD_OP` for small-ish models. By default we use `ShardingStrategy.FULL_SHARD`. 

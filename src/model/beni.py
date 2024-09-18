@@ -110,7 +110,7 @@ class BeniConfig:
     text_cls: str = "AutoModelForCausalLM"
     vision_processor_cls: str = None
     freeze: bool = True
-    attn_implementation: str = "eager"
+    attn_implementation: str = "eager"  # add flash_attention_2 when we get it
     text_config = None
     vision_config = None
     bos_token: Optional[Union[str, List[int]]] = "<s>user:"
@@ -154,12 +154,15 @@ class Beni(nn.Module):
         text_cls = getattr(transformers, config.text_cls, "AutoModelForCausalLM")
 
         # vision
-        v = vision_cls.from_pretrained(config.vision_name_or_path)
-        p = vision_processor_cls.from_pretrained(config.vision_name_or_path)
+        v = vision_cls.from_pretrained(  # type: ignore
+            config.vision_name_or_path,
+            attn_implementation=config.attn_implementation,
+        )
+        p = vision_processor_cls.from_pretrained(config.vision_name_or_path)  # type: ignore
         self.vision = VisionTower(v, p, config.vision_tower_config)
 
         # text
-        self.llm = text_cls.from_pretrained(
+        self.llm = text_cls.from_pretrained(  # type: ignore
             config.text_name_or_path,
             attn_implementation=config.attn_implementation,
             quantization_config=self.config.llm_quantization_config,

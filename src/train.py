@@ -1,8 +1,26 @@
 import os
+from requests import get
 import torch
 import torch.distributed as dist
 import time
 from checkpointing import save_model
+from datetime import datetime
+import logging
+from logging import getLogger, Formatter, StreamHandler
+
+
+log_formatter = Formatter("%(asctime)s [%(levelname)-5.5s] %(message)s")
+console_handler = StreamHandler()
+console_handler.setFormatter(log_formatter)
+
+# sets up persistent logs; already logged in wandb though
+# fileHandler = logging.FileHandler("nate.log")
+# fileHandler.setFormatter(log_formatter)
+
+logger = getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(console_handler)
+# logger.addHandler(fileHandler)
 
 
 def run_eval_step(model, eval_dl):
@@ -14,7 +32,7 @@ def run_eval_step(model, eval_dl):
     with torch.no_grad():
         for _, batch in enumerate(eval_dl):
             if batch is None:  # if we can't download imgs use previous data
-                print(f"Encountered empty batch on rank {dist.get_rank()}")
+                logger.info(f"Encountered empty batch on rank {dist.get_rank()}")
                 batch = prev_batch
             else:
                 prev_batch = batch
@@ -47,7 +65,7 @@ def train(
     eval_dl=None,
     wandb_run=None,
 ):
-    print("training")
+    logger.info("training")
 
     c = train_config
     model.train()
@@ -99,8 +117,8 @@ def train(
                 loss /= dist.get_world_size()
 
                 if os.environ["LOCAL_RANK"] == "0":
-                    print(
-                        f"iter: {e+1}/{total_len}  loss: {c.gradient_accumulation_steps*loss.item():.2f}  lr: {scheduler.get_last_lr()[0]:.6f} [{(time.time()-start_time)/60:.2f} < {(dt*total_len/60):.2f}, {dt:.2f}s/it]"
+                    logger.info(
+                        f"iter: {e+1}/{total_len} loss: {c.gradient_accumulation_steps*loss.item():.2f} mm_projector_lr: {scheduler.get_last_lr()[0]:.6f} llm_lr: {scheduler.get_last_lr()[1]:.6f} [{(time.time()-start_time)/60:.2f} < {(dt*total_len/60):.2f}, {dt:.2f}s/it]"
                     )
 
             if wandb_run is not None:
@@ -130,7 +148,7 @@ def train(
                     dist.barrier()
                     if dist.get_rank() == 0:
                         print("------------------------")
-                        print("running eval...")
+                        logger.info("running eval...")
 
                     # run eval
                     eval_loss = run_eval_step(model, eval_dl)
@@ -142,7 +160,9 @@ def train(
                             step=(e + 1),
                         )
                     if dist.get_rank() == 0:
-                        print(f"iter: {e+1}/{total_len}  eval_loss: {eval_loss:.2f}")
+                        logger.info(
+                            f"iter: {e+1}/{total_len}  eval_loss: {eval_loss:.2f}"
+                        )
                         print("------------------------")
 
     # training done

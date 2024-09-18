@@ -5,20 +5,24 @@ import copy
 import json
 import uuid
 
+from accelerate.hooks import attach_align_device_hook
 import torch
 import torch.distributed as dist
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
+    ShardingStrategy,
 )
 
 # fsdp layers
-from transformers import get_constant_schedule_with_warmup
+from transformers import SiglipVisionModel, get_constant_schedule_with_warmup
 
 from peft import get_peft_model, LoraConfig
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
-from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
+from transformers.models.siglip.modeling_siglip import (
+    SiglipEncoderLayer,
+)
 
 # local
 from model.vision import VisionTowerConfig
@@ -256,19 +260,19 @@ if __name__ == "__main__":
     )
 
     train_config = TrainConfig(
-        warmup_ratio=0.03,
-        batch_size=9,
+        warmup_ratio=0.00,
+        batch_size=8,
         gradient_accumulation_steps=1,
         mm_connector_lr=0.00001,
         # llm_lr=6e-04,
         weight_decay=0.1,
         grad_clip=1.0,
-        save_steps=1000,
+        save_steps=5000,
         do_eval=False,
         eval_steps=500,
         log_steps=1,
-        ckpt_path=None,
-        save_path="/mnt/nate/model_checkpoints/smol",
+        ckpt_path="/mnt/nate/model_checkpoints/smoll/step18000",
+        save_path="/mnt/nate/model_checkpoints/smolll",
         betas=[0.9, 0.999],
         scheduler="constant_with_warmup",
         # scheduler="cosine_with_warmup",
@@ -292,6 +296,7 @@ if __name__ == "__main__":
         ),
         fsdp_activation_checkpointing=False,
         fsdp_cpu_offload=False,
+        sharding_strategy=ShardingStrategy.NO_SHARD,
     )
     wandb_config = WandbConfig(
         enable=True,
