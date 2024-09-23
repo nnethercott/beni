@@ -21,8 +21,8 @@ import os
 import logging
 
 
-sys.path.insert(1, "../src/")
-from model import Beni, BeniConfig
+sys.path.insert(1, "../src/vlm/")
+from model import VLM, VLMConfig
 from checkpointing import load_model
 
 logger = logging.getLogger(__name__)
@@ -41,12 +41,12 @@ print(f"running model from checkpoint: {CKPT_DIR}")
 
 with open(f"{CKPT_DIR}/../model_config.json", "r") as f:
     config_dict = json.loads(f.read())
-    MODEL_CONFIG = BeniConfig.from_dict(config_dict)
+    MODEL_CONFIG = VLMConfig.from_dict(config_dict)
 
 # MODEL_CONFIG.llm_quantization_config = quantization_config
 
 # defined globally
-model = Beni(MODEL_CONFIG, os.getenv("HF_TOKEN"))
+model = VLM(MODEL_CONFIG, os.getenv("HF_TOKEN"))
 model = load_model(model, ckpt_dir=CKPT_DIR, trainable=False)
 device = "cuda"
 # model.to(torch.float16)
@@ -139,6 +139,7 @@ class GenerationArguments:
     do_sample: bool = True
     num_beams: int = 1
     num_return_sequences: int = 1
+    repetition_penalty: float = 1.2
     top_k: int = 32
 
 

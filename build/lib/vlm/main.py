@@ -36,7 +36,7 @@ from utils.train_utils import (
 from configs import TrainConfig, WandbConfig, FSDPConfig
 from checkpointing import load_model
 from data import get_train_dataloader
-from model import Beni, BeniConfig
+from model import VLM, VLMConfig
 from train import train
 
 # possibly needed for training models like llama3
@@ -111,11 +111,11 @@ def fsdp_main(model_config, **kwargs):
 
         # quantized
         if model_config.llm_quantization_config is not None:
-            model = Beni(model_config, hf_token=TOKEN)
+            model = VLM(model_config, hf_token=TOKEN)
         else:
             # load on cpu:0 only
             if rank == 0:
-                model = Beni(model_config, hf_token=TOKEN)
+                model = VLM(model_config, hf_token=TOKEN)
 
                 # load from checkpoint; merges any loras into base llm
                 if train_config.ckpt_path is not None:
@@ -124,7 +124,7 @@ def fsdp_main(model_config, **kwargs):
 
             else:
                 with torch.device("meta"):
-                    model = Beni(model_config, hf_token=TOKEN)
+                    model = VLM(model_config, hf_token=TOKEN)
 
         if train_config.enable_peft:
             assert (
@@ -164,7 +164,7 @@ def fsdp_main(model_config, **kwargs):
 
     else:
         # TODO add non fsdp training
-        model = Beni(model_config)
+        model = VLM(model_config)
 
     if rank == 0:
         print(model)  # type: ignore
@@ -245,7 +245,7 @@ if __name__ == "__main__":
 
     # <|im_start|>system\nYou are a helpful assistant<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n
 
-    model_config = BeniConfig(
+    model_config = VLMConfig(
         vision_name_or_path="google/siglip-so400m-patch14-384",
         # vision_name_or_path="openai/clip-vit-large-patch14-336",
         text_name_or_path="HuggingFaceTB/SmolLM-135M-Instruct",

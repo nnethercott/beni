@@ -3,6 +3,7 @@ from typing import Optional, List, Tuple, Union, Any
 from PIL import Image
 import os
 import dacite
+import copy
 
 import torch
 from torch import nn
@@ -60,7 +61,7 @@ class Connector(nn.Module):
 
 
 # @dataclass
-# class BeniConfig(PretrainedConfig):
+# class VLMConfig(PretrainedConfig):
 #    model_type = "beni"
 #    is_composition = True
 #
@@ -102,13 +103,13 @@ class Connector(nn.Module):
 
 
 @dataclass
-class BeniConfig:
+class VLMConfig:
     text_name_or_path: str
     vision_name_or_path: str
     vision_tower_config: VisionTowerConfig
-    vision_cls: str = None
-    text_cls: str = "AutoModelForCausalLM"
-    vision_processor_cls: str = None
+    vision_cls: Optional[str] = "AutoModel"
+    text_cls: Optional[str] = "AutoModelForCausalLM"
+    vision_processor_cls: Optional[str] = "AutoImageProcessor"
     freeze: bool = True
     attn_implementation: str = "eager"  # add flash_attention_2 when we get it
     text_config = None
@@ -119,20 +120,30 @@ class BeniConfig:
     llm_quantization_config: Optional[Any] = None
 
     def to_dict(self):
-        return asdict(self)
+        # bit more work needs to go in here
+        config_copy = copy.deepcopy(self)
+        perceiver_config = config_copy.vision_tower_config.perceiver_config
+        if perceiver_config is not None:
+            perceiver_config = perceiver_config.to_dict()
+
+        config_copy = asdict(config_copy)
+        config_copy["vision_tower_config"]["perceiver_config"] = perceiver_config
+
+        return config_copy
 
     @classmethod
     def from_dict(cls, config_dict):
+        # FIXME later -> might not be able to load PretrainedConfig ?
         return dacite.from_dict(cls, config_dict)
 
 
-class Beni(nn.Module):
+class VLM(nn.Module):
     """
-    todo:
-        * allow for prompt templates
+    Torch module representing a vision-language model.
+    [Example goes here with some other comments]
     """
 
-    def __init__(self, config: BeniConfig, hf_token=None):
+    def __init__(self, config: VLMConfig, hf_token=None):
         super().__init__()
         self.config = config
         self.token = hf_token
@@ -450,7 +461,7 @@ if __name__ == "__main__":
         grid=(2, 2),
     )
 
-    model_config = BeniConfig(
+    model_config = VLMConfig(
         vision_name_or_path="google/siglip-so400m-patch14-384",
         text_name_or_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         vision_tower_config=vision_tower_config,
@@ -469,13 +480,13 @@ if __name__ == "__main__":
 
     with open("/mnt/nate/model_checkpoints/ref/model_config.json", "r") as f:
         config_dict = json.loads(f.read())
-    model_config = BeniConfig.from_dict(config_dict)
+    model_config = VLMConfig.from_dict(config_dict)
 
-    beni = Beni(model_config)
-    beni = load_model(beni, "/mnt/nate/model_checkpoints/ref/", trainable=False)
-    print(beni)
+    model = VLM(model_config)
+    model = load_model(model, "/mnt/nate/model_checkpoints/ref/", trainable=False)
+    print(model)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    beni.to(device)
+    model.to(device)
 
     inputs = {}
     img = Image.open(
@@ -491,7 +502,7 @@ if __name__ == "__main__":
     # sentence = ""
 
     template = model_config.instruction_template
-    inputs = beni.tokenizer(
+    inputs = model.tokenizer(
         template.format(instruction=sentence),
         return_tensors="pt",
         add_special_tokens=False,
@@ -501,11 +512,11 @@ if __name__ == "__main__":
 
     for k, v in inputs.items():
         if isinstance(v, torch.Tensor):
-            inputs[k] = v.to(beni.device)
+            inputs[k] = v.to(model.device)
 
     # out = beni(**inputs)
     print("generating...")
-    out = beni.generate(
+    out = model.generate(
         **inputs,
         max_new_tokens=128,
         # temperature=0.7,
@@ -514,14 +525,14 @@ if __name__ == "__main__":
         num_return_sequences=1,
         do_sample=False,
         eos_token_id=[
-            beni.tokenizer.eos_token_id,
-            beni.tokenizer.pad_token_id,
+            model.tokenizer.eos_token_id,
+            model.tokenizer.pad_token_id,
         ],
     )
     if "input_ids" in inputs.keys():
-        print(beni.tokenizer.batch_decode(inputs["input_ids"]))
+        print(model.tokenizer.batch_decode(inputs["input_ids"]))
 
-    print(beni.tokenizer.batch_decode(out))
+    print(model.tokenizer.batch_decode(out))
 
     # from data import load_recap, sft_collate_fn
     # import functools

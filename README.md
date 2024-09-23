@@ -9,7 +9,7 @@
 * [minigptv](https://github.com/Vision-CAIR/MiniGPT-4) (concat of visual tokens, llava-style archi)
 
 ### papers and articles 
-* [fuzzy deduplication with minhash]("https://blog.nelhage.com/post/fuzzy-dedup/")
+* [fuzzy deduplication with minhash](https://blog.nelhage.com/post/fuzzy-dedup/)
 * [estimating transformer FLOPs](https://www.adamcasson.com/posts/transformer-flops)
 * [making gpus go brrr](https://horace.io/brrr_intro.html)
 * [idefics2](https://arxiv.org/pdf/2405.02246)
@@ -160,3 +160,9 @@ the issue with this is that if we skip a batch one rank may encounter the `save_
 
 ## Best Practices
 * if the model can fit on a single GPU use `ShardingStrategy.NO_SHARD` (equivalent to DDP). otherwise try `ShardingStrategy.SHARD_GRAD_OP` for small-ish models. By default we use `ShardingStrategy.FULL_SHARD`. 
+
+
+## Training with vertex ai 
+* either upload sdist of the project to a google bucket or use custom docker image 
+* `AIP_CHECKPOINT_DIR` env variable defined if we specify [`baseOutputDirectory` API field](https://cloud.google.com/vertex-ai/docs/training/code-requirements)
+* can run hyperparameter tuning job to find best meta architecture

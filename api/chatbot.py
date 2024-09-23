@@ -39,12 +39,15 @@ def vlm(text_prompt, image=None):
         messages = [{"role": "user", "content": text_prompt}]
 
     data = {
-        "model": "beni1.6b",
+        "model": "vlm",
         "messages": messages,
         "max_tokens": 384,
         "temperature": 0.7,
-        "top_k": 64,
-        "do_sample": True,
+        # "top_k": 64,
+        "do_sample": False,
+        "num_return_sequences": 1,
+        "num_beams": 3,
+        "repetition_penalty": 1.2,
     }
 
     headers = {"Content-Type": "application/json"}
