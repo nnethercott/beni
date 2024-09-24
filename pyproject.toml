@@ -1,5 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "deepo-vlm"
+description = "A VLM training framework."
+version = "0.0.1"
+readme = "README.md"
+license = { text = "MIT License" }
+authors = [
+  { name = "Nate Nethercott", email = "nathaniel.nethercott@deepomatic.com" },
+]
+dependencies = [
+  "numpy",
+  "dacite",
+  "Pillow",
+  "Requests",
+  "tqdm",
+  "transformers==4.43.3",
+  "peft>=0.12.0",
+]
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+]
+
+# [ project.optional_dependencies ] 
+# api = [
+#     "Flask==3.0.3",
+#     "gradio==4.43.0",
+# ]
+
+# [project.scripts]
+# train-vlm = "vlm:main:fsdp_main"  # still need to add argparser & docs
+
 [tool.ruff]
 line-length = 88
 extend-exclude = ["*.ipynb"]
-ignore = ['F403', 'E402', 'E722', 'E741']
+ignore = ['F403', 'E402', 'E722', 'E741', 'F401']
 exclude = ['src/hf_train.py', 'src/finetuning.py', 'src/fsdp.py']

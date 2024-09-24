@@ -9,3 +9,6 @@ api/tmpimages
 src/data/data
 **/*.ipynb_checkpoints
 requirements.txt
+third_party/*
+dist
+**/*.egg-info
