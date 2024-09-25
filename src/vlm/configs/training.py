@@ -26,6 +26,10 @@ class TrainConfig:
     save_path: Optional[str] = None
     fsdp: bool = True
     enable_peft: bool = False
+    tf32: bool = False
+    fp16: bool = False
+    mixed_precision: bool = False
+    bfloat16: bool = False
 
 
 @dataclass

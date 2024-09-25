@@ -135,7 +135,7 @@ def print_model_size(model, config, rank: int = 0) -> None:
         print(f"\n--> {config.model_name} has {total_params / 1e6} Million params\n")
 
 
-def get_policies(cfg, rank):
+def get_mixed_precision_policy(cfg, rank):
     """Get the policies for mixed precision and fsdp wrapping"""
 
     verify_bfloat_support = (
@@ -147,24 +147,22 @@ def get_policies(cfg, rank):
     ) or (is_xpu_available())
 
     mixed_precision_policy = None
-    wrapping_policy = None
 
     # Mixed precision
     if cfg.mixed_precision:
         bf16_ready = verify_bfloat_support
 
-        if bf16_ready and not cfg.use_fp16:
+        if bf16_ready and cfg.bfloat16:
             mixed_precision_policy = bfSixteen
             if rank == 0:
                 print("bFloat16 enabled for mixed precision - using bfSixteen policy")
-        elif cfg.use_fp16:
+        elif cfg.fp16:
             mixed_precision_policy = fpSixteen
             if rank == 0:
                 print("FP16 enabled")
         else:
             print("bFloat16 support not present. Using FP32, and not mixed precision")
-    wrapping_policy = get_llama_wrapper()
-    return mixed_precision_policy, wrapping_policy
+    return mixed_precision_policy
 
 
 # https://github.com/huggingface/transformers/blob/e65502951593a76844e872fee9c56b805598538a/src/transformers/optimization.py#L135

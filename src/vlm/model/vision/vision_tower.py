@@ -113,11 +113,11 @@ class VisionTower(nn.Module):
     def device(self):
         return self.vision.device
 
-    @property
-    def torch_dtype(self):
-        dtypes = set((p.dtype for p in self.vision.parameters()))
-        assert len(dtypes) == 1
-        return list(dtypes)[0]
+    # @property
+    # def torch_dtype(self):
+    #     dtypes = set((p.dtype for p in self.vision.parameters()))
+    #     assert len(dtypes) == 1
+    #     return list(dtypes)[0]
 
     def get_image_processor(
         self, processor, img_size: int
@@ -173,7 +173,8 @@ class VisionTower(nn.Module):
             fwd_kwargs["interpolate_pos_encoding"] = True
 
         x = self.vision(
-            x.to(self.device, self.torch_dtype),  # type: ignore
+            x.to(self.device),
+            # x.to(self.device, self.torch_dtype),  # type: ignore
             output_hidden_states=True,
             **fwd_kwargs,
         )

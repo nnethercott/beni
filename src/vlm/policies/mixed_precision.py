@@ -18,6 +18,7 @@ fpSixteen = MixedPrecision(
     reduce_dtype=torch.float16,
     # Buffer precision.
     buffer_dtype=torch.float16,
+    keep_low_precision_grads=False,  # default
 )
 
 bfSixteen = MixedPrecision(
@@ -27,8 +28,11 @@ bfSixteen = MixedPrecision(
     # Buffer precision.
     buffer_dtype=torch.bfloat16,
     cast_forward_inputs=True,
+    keep_low_precision_grads=False,  # default
 )
 
+
+# we don't use these rn
 bfSixteen_mixed = MixedPrecision(
     param_dtype=torch.float32,
     reduce_dtype=torch.bfloat16,

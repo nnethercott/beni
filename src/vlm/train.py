@@ -1,10 +1,11 @@
-import os
-from requests import get
+from contextlib import nullcontext
 import torch
 import torch.distributed as dist
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+from torch.amp.grad_scaler import GradScaler
 import time
 from checkpointing import save_model
-from datetime import datetime
+import os
 import logging
 from logging import getLogger, Formatter, StreamHandler
 
@@ -22,42 +23,10 @@ logger.setLevel(logging.INFO)
 logger.addHandler(console_handler)
 # logger.addHandler(fileHandler)
 
-logger.info(os.getenv("WANDB_API_KEY", "nate"))
+# logger.info(os.getenv("WANDB_API_KEY", "nate"))
 
 
-def run_eval_step(model, eval_dl):
-    prev_batch = {}
-    losses = []
-
-    # set model to eval
-    model.eval()
-    with torch.no_grad():
-        for _, batch in enumerate(eval_dl):
-            if batch is None:  # if we can't download imgs use previous data
-                logger.info(f"Encountered empty batch on rank {dist.get_rank()}")
-                batch = prev_batch
-            else:
-                prev_batch = batch
-
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    batch[k] = v.to(model.device)
-
-            # forward pass
-            out = model(**batch, output_attentions=False)
-            loss = out["loss"]
-
-            # all reduce
-            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-            loss /= dist.get_world_size()
-            losses.append(loss.detach().cpu().item())
-
-    # set model back to train again
-    model.train()
-
-    return sum(losses) / len(losses)
-
-
+# so far only works when launching with fsdp
 def train(
     model,
     optimizer,
@@ -70,51 +39,96 @@ def train(
     logger.info("training")
 
     c = train_config
-    model.train()
 
-    # recover rank
+    # tf32 (only on ampere)
+    compute_capability_major, compute_capability_minor = (
+        torch.cuda.get_device_capability()
+    )
+    if c.tf32:
+        if compute_capability_major >= 8:
+            logger.info("Enabling lower precision tf32 computation")
+            torch.set_float32_matmul_precision = "medium"  # | "highest", "high"
+        else:
+            logger.info(
+                "Device compute capability is: {compute_capability_major}.{compute_capability_minor} -- running in fp32"
+            )
+
+    # mixed precision scalers
+    if c.fp16 and c.fsdp:
+        scaler = ShardedGradScaler()
+    elif c.fp16 and not c.fsdp:
+        scaler = GradScaler()
+
+    # handles moving inputs to right dtype
+    autocast = (
+        torch.autocast(device_type="cuda") if c.fp16 or c.bfloat16 else nullcontext()
+    )
+
     rank = dist.get_rank()
+    _world_size = dist.get_world_size()
+    model.train()
 
     start_time = time.time()
     prev_batch = {}
 
-    # FIXME: we've consumed the dataloader already here in first epoch; copy it or something
     for i in range(c.n_epochs):
         train_dl = train_dl_factory()
         total_len = len(train_dl)
 
         for e, batch in enumerate(train_dl):
+            optimizer.zero_grad()
+
             tik = time.time()
             if batch is None:  # if we can't download imgs use previous data
                 print(f"Encountered empty batch on rank {dist.get_rank()}")
                 batch = prev_batch
             else:
-                # potentially is just a single sample
                 prev_batch = batch
-
-            # print(batch.keys())
-            # print(batch["input_ids"].shape)
 
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
-                    batch[k] = v.to(model.device)  # assumes gpu training
+                    batch[k] = v.to(model.device)
 
-            # forward pass
-            out = model(**batch, output_attentions=False)
-            loss = out["loss"]
+            # autocast forward pass
+            with autocast:
+                loss = model(**batch, output_attentions=False)["loss"]
+                loss = loss / c.gradient_accumulation_steps
 
-            loss = loss / c.gradient_accumulation_steps
-            loss.backward()
+            if c.fp16:
+                scaler.scale(loss).backward()  # type: ignore
+                if (e + 1) % c.gradient_accumulation_steps == 0:
+                    if c.grad_clip is not None:
+                        scaler.unscale_(optimizer)
+                        if c.fsdp:
+                            model.clip_grad_norm_(c.grad_clip)
+                        else:
+                            torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), c.grad_clip
+                            )
+                        pass
 
-            if (e + 1) % c.gradient_accumulation_steps == 0:
-                if c.grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), c.grad_clip)
-                optimizer.step()
-                optimizer.zero_grad()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+            else:
+                loss.backward()
+                if (e + 1) % c.gradient_accumulation_steps == 0:
+                    if c.grad_clip is not None:
+                        if c.fsdp:
+                            model.clip_grad_norm_(c.grad_clip)
+                        else:
+                            torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), c.grad_clip
+                            )
+                    optimizer.step()
+                    optimizer.zero_grad()
 
+            # step lr
             scheduler.step()
 
+            # logging stuff
             if (e + 1) % c.log_steps == 0:
+                # optimization, only all reduce on log steps
                 dt = time.time() - tik
 
                 dist.all_reduce(loss, op=dist.ReduceOp.SUM)
@@ -176,3 +190,36 @@ def train(
         if c.save_path is not None:
             save_dir = os.path.join(c.save_path, f"epoch{i+1}_step{total_len}")
             save_model(model, save_dir=save_dir, rank=dist.get_rank())
+
+
+def run_eval_step(model, eval_dl):
+    prev_batch = {}
+    losses = []
+
+    # set model to eval
+    model.eval()
+    with torch.no_grad():
+        for _, batch in enumerate(eval_dl):
+            if batch is None:  # if we can't download imgs use previous data
+                logger.info(f"Encountered empty batch on rank {dist.get_rank()}")
+                batch = prev_batch
+            else:
+                prev_batch = batch
+
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(model.device)
+
+            # forward pass
+            out = model(**batch, output_attentions=False)
+            loss = out["loss"]
+
+            # all reduce -- might be slow here, could reduce AFTER loop through batch
+            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+            loss /= dist.get_world_size()
+            losses.append(loss.detach().cpu().item())
+
+    # set model back to train again
+    model.train()
+
+    return sum(losses) / len(losses)
