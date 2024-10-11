@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.amp.grad_scaler import GradScaler
@@ -10,7 +11,7 @@ import logging
 from logging import getLogger, Formatter, StreamHandler
 
 
-log_formatter = Formatter("%(asctime)s [%(levelname)-5.5s] %(message)s")
+log_formatter = Formatter("%(asctime)s [%(levelname)-8.8s] %(message)s")
 console_handler = StreamHandler()
 console_handler.setFormatter(log_formatter)
 
@@ -77,10 +78,11 @@ def train(
 
         for e, batch in enumerate(train_dl):
             optimizer.zero_grad()
+            # print(batch)
 
             tik = time.time()
             if batch is None:  # if we can't download imgs use previous data
-                print(f"Encountered empty batch on rank {dist.get_rank()}")
+                logger.warning(f"Encountered empty batch on rank {dist.get_rank()}")
                 batch = prev_batch
             else:
                 prev_batch = batch
@@ -136,7 +138,7 @@ def train(
 
                 if os.environ["LOCAL_RANK"] == "0":
                     logger.info(
-                        f"iter: {e+1}/{total_len} loss: {c.gradient_accumulation_steps*loss.item():.2f} mm_projector_lr: {scheduler.get_last_lr()[0]:.6f} llm_lr: {scheduler.get_last_lr()[1]:.6f} [{(time.time()-start_time)/60:.2f} < {(dt*total_len/60):.2f}, {dt:.2f}s/it]"
+                        f"epoch: {i+1}/{c.n_epochs} iter: {e+1}/{total_len} loss: {c.gradient_accumulation_steps*loss.item():.2f} mm_projector_lr: {scheduler.get_last_lr()[0]:.6f} llm_lr: {scheduler.get_last_lr()[1]:.6f} [{(time.time()-start_time)/60:.2f} < {(dt*total_len/60):.2f}, {dt:.2f}s/it]"
                     )
 
             if wandb_run is not None:

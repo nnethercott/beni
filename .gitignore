@@ -12,3 +12,5 @@ requirements.txt
 third_party/*
 dist
 **/*.egg-info
+**/*test_*
+llava.py

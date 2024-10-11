@@ -14,6 +14,9 @@
 * [making gpus go brrr](https://horace.io/brrr_intro.html)
 * [idefics2](https://arxiv.org/pdf/2405.02246)
 * [llava-next ablations blog post](https://llava-vl.github.io/blog/2024-05-25-llava-next-ablations/)
+* [What Every User Should Know About Mixed Precision Training in PyTorch](https://pytorch.org/blog/what-every-user-should-know-about-mixed-precision-training-in-pytorch/)
+* [Automatic Mixed Precision examples](https://pytorch.org/docs/stable/notes/amp_examples.html#typical-mixed-precision-training)
+
 
 ## feature roadmap:
 * [x] convert to using llama-recipes training framework [25/07/24]
@@ -155,8 +158,16 @@ the issue with this is that if we skip a batch one rank may encounter the `save_
     * this acheives 2x memory reduction which is less than the llm_size/4 + vit_size/2 > 2x reduction we get from llm 4bit quantization normally 
     * this also means we need to scale and unscale half precision loss since `torch.float16` has a small dynamic range (otherwise nans). Ideally we'd use `torch.bfloat16` since it has 8bit exponents vs float16 5bit, but this only works on nvidia gpus with Ampere architecture or newer.
 * [invalid device ordinal](https://stackoverflow.com/questions/64334033/how-to-solve-runtimeerror-cuda-error-invalid-device-ordinal) might occur if you hard set `CUDA_VISIBLE_DEVICES` manually ?
+* `NCCL_SOCKET_IFNAME`: https://github.com/pytorch/pytorch/issues/29482
+* if `dataloader_num_workers` too large, the asynchronous fetching of images may be faster than batches are consumed leading to an explosion in system RAM. Recommended values : {0,1}
+    * conversely we spend a lot of time **waiting** for images to be read and `dataloader_num_workers` can reduce train time by 2-3x. If system has enough RAM and fast GPUs we can justify large values for this field
 
 
+## deepspeed gotchas 
+```python 
+from deepspeed import get_accelerator
+get_accelerator().is_fp16_supported()
+```
 
 ## Best Practices
 * if the model can fit on a single GPU use `ShardingStrategy.NO_SHARD` (equivalent to DDP). otherwise try `ShardingStrategy.SHARD_GRAD_OP` for small-ish models. By default we use `ShardingStrategy.FULL_SHARD`. 

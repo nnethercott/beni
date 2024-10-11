@@ -39,7 +39,7 @@ CKPT_DIR = os.getenv("MODEL_CHECKPOINT", "model")
 
 print(f"running model from checkpoint: {CKPT_DIR}")
 
-with open(f"{CKPT_DIR}/../model_config.json", "r") as f:
+with open(f"{CKPT_DIR}/../config.json", "r") as f:
     config_dict = json.loads(f.read())
     MODEL_CONFIG = VLMConfig.from_dict(config_dict)
 
@@ -51,6 +51,7 @@ model = load_model(model, ckpt_dir=CKPT_DIR, trainable=False)
 device = "cuda"
 # model.to(torch.float16)
 model.to(device)
+# model.to(torch.float16)
 model.eval()
 
 print(model)
@@ -155,13 +156,11 @@ def chat_completion(model, prompt, image=None, **generation_kwargs):
     with torch.no_grad():
         inputs = {}
         if prompt is not None:
-            print("theres text")
             inputs = model.tokenizer(
                 prompt, return_tensors="pt", add_special_tokens=False
             ).to(device)
 
         if image is not None:
-            print("theres image")
             inputs["images"] = [
                 image,
             ]
@@ -175,6 +174,7 @@ def chat_completion(model, prompt, image=None, **generation_kwargs):
 
         torch.cuda.empty_cache()
         generated = model.tokenizer.batch_decode(out, skip_special_tokens=True)[0]
+        print(generated)
 
     # metrics
     usage = {}
@@ -220,10 +220,10 @@ if __name__ == "__main__":
         generation_kwargs = parse_into_generation_kwargs(data)
 
         # add eos token ids
-        generation_kwargs["eos_token_id"] = [
-            model.tokenizer.eos_token_id,
-            model.tokenizer.pad_token_id,
-        ]
+        # generation_kwargs["eos_token_id"] = [
+        #     model.tokenizer.eos_token_id,
+        #     model.tokenizer.pad_token_id,
+        # ]
 
         prompt = parsed["prompt"]
         image = parsed["image"]

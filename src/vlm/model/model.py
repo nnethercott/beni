@@ -1,17 +1,20 @@
-from dataclasses import dataclass, asdict
-from typing import Optional, List, Tuple, Union, Any
+from dataclasses import dataclass, asdict, field
+from typing import Optional, List, Tuple, Union, Any, Dict
 from PIL import Image
 import os
 import dacite
 import copy
+import functools
 
 import torch
-from torch import nn
+from torch import nn, special
 
 import transformers
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoTokenizer,
+    PreTrainedModel,
 )
 from peft import PeftModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -53,7 +56,7 @@ class Connector(nn.Module):
         self.norm = nn.LayerNorm(d_in)
 
         self.proj = nn.Sequential(
-            nn.Linear(d_in, d_out), nn.GELU(), nn.Linear(d_out, d_out)
+            nn.Linear(d_in, d_out), nn.SiLU(), nn.Linear(d_out, d_out)
         )
 
     def forward(self, x):
@@ -64,7 +67,7 @@ class Connector(nn.Module):
 # class VLMConfig(PretrainedConfig):
 #    model_type = "beni"
 #    is_composition = True
-#
+
 #    def __init__(
 #            self,
 #            perceiver_config: PretrainedConfig = None,
@@ -80,7 +83,7 @@ class Connector(nn.Module):
 #            **kwargs,
 #    ):
 #        super().__init__(**kwargs)
-#
+
 #        self.perceiver_config = perceiver_config
 #        self.vision_name_or_path=vision_name_or_path
 #        self.text_name_or_path=text_name_or_path
@@ -91,13 +94,13 @@ class Connector(nn.Module):
 #        self.freeze=freeze
 #        self.attn_implementation=attn_implementation
 #        self.img_size=img_size
-#
+
 #        self._post_init()
-#
+
 #    def _post_init(self):
 #        self.text_config = AutoConfig.from_pretrained(self.text_name_or_path)
 #        self.vision_config = AutoConfig.from_pretrained(self.vision_name_or_path)
-#
+
 #        if hasattr(self.vision_config, 'vision_config'):
 #            self.vision_config = self.vision_config.vision_config
 
@@ -106,18 +109,19 @@ class Connector(nn.Module):
 class VLMConfig:
     text_name_or_path: str
     vision_name_or_path: str
-    vision_tower_config: VisionTowerConfig
-    vision_cls: Optional[str] = "AutoModel"
-    text_cls: Optional[str] = "AutoModelForCausalLM"
-    vision_processor_cls: Optional[str] = "AutoImageProcessor"
+    vision_tower_config: VisionTowerConfig = VisionTowerConfig()  # has defaults
+    vision_cls: str = "AutoModel"
+    text_cls: str = "AutoModelForCausalLM"
+    vision_processor_cls: str = "AutoImageProcessor"
     freeze: bool = True
+    unfreeze_lm_head: bool = False
     attn_implementation: str = "eager"  # add flash_attention_2 when we get it
-    text_config = None
-    vision_config = None
-    bos_token: Optional[Union[str, List[int]]] = "<s>user:"
+    bos_token: str = "<s>user:"
     instruction_template: str = "<s>user:\n{instruction}\n</s>assistant:\n"
     response_template: str = "{response}</s>"
-    llm_quantization_config: Optional[Any] = None
+    llm_quantization_config: Any = None
+    special_tokens: List[str] = field(default_factory=lambda: [])
+    lm_loss_lambda: float = 2.0
 
     def to_dict(self):
         # bit more work needs to go in here
@@ -133,7 +137,7 @@ class VLMConfig:
 
     @classmethod
     def from_dict(cls, config_dict):
-        # FIXME later -> might not be able to load PretrainedConfig ?
+        # FIXME later -> might not be able to load PretrainedConfig for perceiver config
         return dacite.from_dict(cls, config_dict)
 
 
@@ -158,9 +162,9 @@ class VLM(nn.Module):
             self.freeze()
 
     def build_vision_and_text(self, config):
-        vision_cls = getattr(transformers, config.vision_cls, "AutoModel")
+        vision_cls = getattr(transformers, config.vision_cls, AutoModel)
         vision_processor_cls = getattr(
-            transformers, config.vision_processor_cls, "AutoProcessor"
+            transformers, config.vision_processor_cls, "AutoImageProcessor"
         )
         text_cls = getattr(transformers, config.text_cls, "AutoModelForCausalLM")
 
@@ -168,6 +172,7 @@ class VLM(nn.Module):
         v = vision_cls.from_pretrained(  # type: ignore
             config.vision_name_or_path,
             attn_implementation=config.attn_implementation,
+            trust_remote_code=True,
         )
         p = vision_processor_cls.from_pretrained(config.vision_name_or_path)  # type: ignore
         self.vision = VisionTower(v, p, config.vision_tower_config)
@@ -179,13 +184,16 @@ class VLM(nn.Module):
             quantization_config=self.config.llm_quantization_config,
             # torch_dtype = torch.float16,
             token=self.token,
+            trust_remote_code=True,
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.text_name_or_path, token=self.token
         )
         self.tokenizer.padding_side = "right"
-        self.tokenizer.add_tokens(["<img>", "</img>"])
+        self.tokenizer.add_special_tokens(
+            {"additional_special_tokens": config.special_tokens}
+        )
 
         # resize embeddings and lm_head https://huggingface.co/docs/transformers/en/main_classes/model
         self.llm.resize_token_embeddings(len(self.tokenizer))
@@ -197,9 +205,13 @@ class VLM(nn.Module):
         for p in self.connector.parameters():
             p.requires_grad = True  # connector trainable
 
+        if self.config.unfreeze_lm_head:
+            for p in self.llm.lm_head.parameters():
+                p.requires_grad = True
+
         self.vision.unfreeze()  # vision trainable
 
-    @property
+    @functools.cached_property
     def text_config(self):
         return AutoConfig.from_pretrained(
             self.config.text_name_or_path, token=self.token
@@ -209,23 +221,33 @@ class VLM(nn.Module):
     def vision_config(self):
         return self.vision.vision.config
 
-    @property
+    @functools.cached_property
     def img_token(self):
-        return self.tokenizer.encode("<img>", add_special_tokens=False)[0]
+        return self.tokenizer.encode("<|vision_start|>", add_special_tokens=False)[0]
 
-    @property
+    @functools.cached_property
     def end_img_token(self):
-        return self.tokenizer.encode("</img>", add_special_tokens=False)[0]
+        return self.tokenizer.encode("<|vision_end|>", add_special_tokens=False)[0]
 
     @property
     def device(self):
         return self.vision.device
 
-    @property
+    @functools.cached_property
     def embed_tokens(self):
         if isinstance(self.llm, PeftModel):
             return self.llm.model.model.embed_tokens
         return self.llm.model.embed_tokens
+
+    @functools.cached_property
+    def lm_loss_weight(self):
+        # penalize loss on bbox coords
+        token_ids = torch.tensor(self.tokenizer.additional_special_tokens_ids[-101:])
+        lambdas = torch.ones(len(token_ids)) * self.config.lm_loss_lambda
+        lm_loss_weight = torch.ones(len(self.tokenizer))
+        lm_loss_weight.scatter_(0, token_ids, lambdas)
+        # assert lm_loss_weight[token_ids[0]] == self.config.lm_loss_lambda
+        return lm_loss_weight
 
     def prepare_inputs(
         self,
@@ -367,6 +389,7 @@ class VLM(nn.Module):
         ), "You can't forward without text and/or images!"
 
         # print(self.tokenizer.batch_decode(input_ids))
+        # print(self.tokenizer.tokenize(self.tokenizer.batch_decode(input_ids)[0]))
         input_ids, attention_mask, inputs_embeds, labels = self.prepare_inputs(
             input_ids, attention_mask, inputs_embeds, labels, images
         )
@@ -393,6 +416,20 @@ class VLM(nn.Module):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+
+        # # manual llm loss with rescaling on `self.tokenizer.special_tokens`
+        # logits = out["logits"][:, :-1, :].contiguous()
+        # labels = labels[:, 1:].contiguous()
+
+        # logits = logits.view(-1, logits.shape[-1])
+        # labels = labels.view(-1)
+
+        # loss = torch.nn.functional.cross_entropy(
+        #     logits, labels, weight=self.lm_loss_weight.to(self.device)
+        # )
+        # out["loss"] = loss
+
+        # return out
 
     @torch.no_grad()
     def generate(
@@ -478,28 +515,35 @@ if __name__ == "__main__":
     import json
     from checkpointing import load_model
 
-    with open("/mnt/nate/model_checkpoints/ref/model_config.json", "r") as f:
+    with open("/mnt/nate/model_checkpoints/ocr_pretrain/model_config.json", "r") as f:
         config_dict = json.loads(f.read())
     model_config = VLMConfig.from_dict(config_dict)
 
     model = VLM(model_config)
-    model = load_model(model, "/mnt/nate/model_checkpoints/ref/", trainable=False)
+    model = load_model(
+        model,
+        "/mnt/nate/model_checkpoints/ocr_pretrain/epoch3_step10418",
+        trainable=False,
+        merge_and_unload=False,
+    )
     print(model)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
     model.to(device)
 
     inputs = {}
     img = Image.open(
         io.BytesIO(
             requests.get(
-                "https://titanicfacts.net/wp-content/uploads/2018/06/titanic-deep-atlantic.jpg"
+                "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcR2cr2cdaSW2n9cGUoquqDF3dVd8R5i6OGHkQ&s"
             ).content
         )
     ).convert("RGB")
     print(img)
 
-    sentence = "provide a descriptive caption for this image"
-    # sentence = ""
+    # sentence = "Describe this image, focusing on the objects present and their positions, using bounding boxes and coordinates."
+    # sentence = "tell me a funny joke"
+    sentence = "Read the text in this image."
 
     template = model_config.instruction_template
     inputs = model.tokenizer(
@@ -522,12 +566,13 @@ if __name__ == "__main__":
         # temperature=0.7,
         # top_p=0.95,
         num_beams=3,
+        repetition_penalty=1.2,
         num_return_sequences=1,
         do_sample=False,
-        eos_token_id=[
-            model.tokenizer.eos_token_id,
-            model.tokenizer.pad_token_id,
-        ],
+        # eos_token_id=[
+        #     model.tokenizer.eos_token_id,
+        #     model.tokenizer.pad_token_id,
+        # ],
     )
     if "input_ids" in inputs.keys():
         print(model.tokenizer.batch_decode(inputs["input_ids"]))

@@ -2,6 +2,7 @@ import datasets
 import torch
 from torch.utils.data import Dataset
 import os
+import re
 import random
 from urllib.parse import urlparse
 from transformers import AutoTokenizer
@@ -9,39 +10,6 @@ from typing import List
 import requests
 from PIL import Image
 import io
-
-
-from .minhash import MinHashLSHDeduplicator
-
-
-# or use wordllama: https://huggingface.co/dleemiller/word-llama-l2-supercat
-def fuzzy_filter(*datasets, tokenizer: AutoTokenizer):
-    """
-    use dataset.data so we avoid loading images
-    """
-    datasets = list(datasets)
-
-    # for some reason dataset.Dataset.to_list() converts pil images to bytes so we need
-    # to update the CustomDataset.data attribute AFTER creation
-
-    text_only = []
-    for d in datasets:
-        if isinstance(d.data, dict):
-            d.data = [dict(zip(d.data, t)) for t in zip(*d.data.values())]
-        text_only.append([item["response"] for item in d.data])
-
-    # fuzzy deduplication with minhash
-    minhash = MinHashLSHDeduplicator(tokenizer, *text_only)
-    duplicate_ids = minhash.deduplicate(jaccard_sim=0.85, num_perm=128)
-
-    print(f"{len(duplicate_ids)} duplicates detected!\nremoving them now...")
-
-    # clean original datasets
-    for e, id_list in enumerate(duplicate_ids):
-        for idx in id_list[::-1]:
-            _ = datasets[e].data.pop(idx)
-
-    return datasets
 
 
 # torch.utils.data.Dataset subclass
@@ -85,7 +53,12 @@ class LazyCustomDatasetForImages(CustomDataset):
 
     def __getitem__(self, idx):
         sample = self.data[idx]
-        assert "url" in sample.keys(), "sample with no `url` field detected!"
+        if "images" in sample.keys():
+            return sample
+
+        assert (
+            "url" in sample.keys() or "image" in sample.keys()
+        ), "sample with no `url` field detected!"
 
         try:
             img = self.get_image(sample["url"])
@@ -257,7 +230,7 @@ def apply_chat_template(
     response_template=None,
 ):
     if instruction_template is None:
-        instruction_template = ("<s>user:\n{instruction}</s>assistant:\n",)
+        instruction_template = "<s>user:\n{instruction}</s>assistant:\n"
     if response_template is None:
         response_template = "{response}</s>"
 
@@ -322,7 +295,8 @@ def grounded_qa(coords_and_labels: List[dict]):
     # some string formatting
     chunks = [i["chunk"] for i in items]
     boxes = [[round(x, 2) for c in i["coord"] for x in c] for i in items]
-    boxes = [str(box) for box in boxes]
+    boxes = ["<bbox>" + str(box) + "</bbox>" for box in boxes]
+    boxes = [re.sub(r" ", "", b) for b in boxes]
     named_boxes = [f"{c}: {b}" for c, b in zip(chunks, boxes)]
 
     kwargs = {
@@ -335,3 +309,36 @@ def grounded_qa(coords_and_labels: List[dict]):
     ]  # more bbox than ocr
 
     return template[0].format(**kwargs), template[1].format(**kwargs)
+
+
+# or use wordllama: https://huggingface.co/dleemiller/word-llama-l2-supercat
+from .minhash import MinHashLSHDeduplicator
+
+
+def fuzzy_filter(*datasets, tokenizer: AutoTokenizer):
+    """
+    use dataset.data so we avoid loading images
+    """
+    datasets = list(datasets)
+
+    # for some reason dataset.Dataset.to_list() converts pil images to bytes so we need
+    # to update the CustomDataset.data attribute AFTER creation
+
+    text_only = []
+    for d in datasets:
+        if isinstance(d.data, dict):
+            d.data = [dict(zip(d.data, t)) for t in zip(*d.data.values())]
+        text_only.append([item["response"] for item in d.data])
+
+    # fuzzy deduplication with minhash
+    minhash = MinHashLSHDeduplicator(tokenizer, *text_only)
+    duplicate_ids = minhash.deduplicate(jaccard_sim=0.85, num_perm=128)
+
+    print(f"{len(duplicate_ids)} duplicates detected!\nremoving them now...")
+
+    # clean original datasets
+    for e, id_list in enumerate(duplicate_ids):
+        for idx in id_list[::-1]:
+            _ = datasets[e].data.pop(idx)
+
+    return datasets

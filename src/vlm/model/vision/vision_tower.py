@@ -48,16 +48,16 @@ def grid_based_crop_numpy(
 
 @dataclass
 class VisionTowerConfig:
-    r: int = 1
+    n_concat_tokens: int = 1
     img_size: int = 384
     use_cls: bool = False
     feature_select_index: int = -1
     perceiver_config: Optional[PerceiverResamplerConfig] = None
     sparsity_plugins: Optional[List[sparsity.BilinearConfig]] = None
 
-    # in the future make this take grid patterns
-    grid: Union[List[int], Tuple[int, int]] = field(
-        default_factory=lambda: (1, 1)
+    # NOTE: this can't get parsed by cmdline, need to make this string or something in hf
+    grid: List[int] = field(
+        default_factory=lambda: [1, 1]
     )  # json stores tuples as list
 
     use_global_crop: bool = False
@@ -73,7 +73,7 @@ class VisionTower(nn.Module):
         super().__init__()
         self.feature_select_index = config.feature_select_index  # add to config
         self.cls_idx = 0 if config.use_cls else 1
-        self.r = config.r
+        self.r = config.n_concat_tokens
         self.grid = tuple(config.grid)
         self.use_global_crop = config.use_global_crop
 
@@ -113,11 +113,11 @@ class VisionTower(nn.Module):
     def device(self):
         return self.vision.device
 
-    # @property
-    # def torch_dtype(self):
-    #     dtypes = set((p.dtype for p in self.vision.parameters()))
-    #     assert len(dtypes) == 1
-    #     return list(dtypes)[0]
+    @property
+    def torch_dtype(self):
+        dtypes = set((p.dtype for p in self.vision.parameters()))
+        # assert len(dtypes) == 1
+        return list(dtypes)[0]
 
     def get_image_processor(
         self, processor, img_size: int
@@ -126,8 +126,11 @@ class VisionTower(nn.Module):
 
         if isinstance(processor.size, dict):
             processor.size = {"height": img_size, "width": img_size}
+            img_size = {"height": img_size, "width": img_size}  # type: ignore
         elif isinstance(processor.size, int):
             processor.size = img_size
+
+        # print(self.is_high_res)
 
         return processor
 
@@ -173,8 +176,7 @@ class VisionTower(nn.Module):
             fwd_kwargs["interpolate_pos_encoding"] = True
 
         x = self.vision(
-            x.to(self.device),
-            # x.to(self.device, self.torch_dtype),  # type: ignore
+            x.to(self.device, self.torch_dtype),  # type: ignore
             output_hidden_states=True,
             **fwd_kwargs,
         )
@@ -205,6 +207,7 @@ class VisionTower(nn.Module):
 
         x = self.resampler(x, attention_mask)
         b, s = x.shape[:2]
+        # print(x.shape)
 
         # concatenate adjacent tokens a la minigpt4-v2
         return x.reshape((b, s // self.r, -1))

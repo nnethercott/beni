@@ -18,14 +18,19 @@ class TrainConfig:
     grad_clip: Optional[float] = 1.0
     weight_decay: float = 0.0
     mm_connector_lr: float = 1e-05
-    llm_lr: float = 1e-04
+    llm_lr: float = 0.0
     min_lr: float = 1e-05
-    betas: List = field(default_factory=lambda: [0.9, 0.999])
-    scheduler: str = "cosine_with_warmup"
+    betas: List[float] = field(
+        default_factory=lambda: [0.9, 0.999], metadata={"help": "AdamW betas"}
+    )
+    scheduler: str = field(
+        default="cosine_with_warmup", metadata={"help": "Scheduler type"}
+    )
     ckpt_path: Optional[str] = None
     save_path: Optional[str] = None
     fsdp: bool = True
-    enable_peft: bool = False
+    enable_peft_llm: bool = False
+    enable_peft_vision: bool = False
     tf32: bool = False
     fp16: bool = False
     mixed_precision: bool = False

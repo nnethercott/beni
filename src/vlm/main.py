@@ -17,7 +17,6 @@ from torch.distributed.fsdp import (
 
 # fsdp layers
 from transformers import (
-    PerceiverLayer,
     SiglipVisionModel,
     get_constant_schedule_with_warmup,
 )
@@ -33,13 +32,14 @@ from transformers.models.vit.modeling_vit import ViTLayer
 
 # local
 from model.vision import VisionTowerConfig
-from policies.wrapping import fsdp_auto_wrap_policy
+from policies import fsdp_auto_wrap_policy
 import policies
 from utils.train_utils import (
     clear_gpu_cache,
     setup_environ_flags,
-    get_cosine_schedule_with_warmup,
+    get_mixed_precision_policy,
 )
+from transformers import get_cosine_schedule_with_warmup
 from configs import TrainConfig, WandbConfig, FSDPConfig
 from checkpointing import load_model
 from data import get_train_dataloader
@@ -52,6 +52,7 @@ from model import (
 )
 from model.vision.sparsity import BilinearConfig
 from train import train
+from policies.anyprecision_optimizer import AnyPrecisionAdamW
 
 # possibly needed for training models like llama3
 TOKEN = os.getenv("HF_TOKEN", None)
@@ -95,12 +96,6 @@ def fsdp_main(model_config, **kwargs):
         "lora_config": lora_config,
     }
 
-    # save environment
-    if rank == 0:
-        os.system("pipreqs --encoding utf-8 --ignore '.env' .")
-        with open("requirements.txt", "r") as f:
-            configs["pip_env"] = f.read().splitlines()
-
     wandb_run = wandb_config.build_run(configs, rank == 0)
 
     # setup each cuda device ('device' aliased to cuda:n)
@@ -120,11 +115,6 @@ def fsdp_main(model_config, **kwargs):
                 with open(f"{s}/model_config.json", "w") as f:
                     f.write(json.dumps(model_config_copy))
 
-                # move pip_env to model run
-                os.system(f"mv requirements.txt {s}")
-            else:
-                os.system("rm requirements.txt")  # remove
-
         # quantized
         if model_config.llm_quantization_config is not None:
             model = VLM(model_config, hf_token=TOKEN)
@@ -132,6 +122,11 @@ def fsdp_main(model_config, **kwargs):
             # load on cpu:0 only
             if rank == 0:
                 model = VLM(model_config, hf_token=TOKEN)
+
+                if train_config.save_path is not None:
+                    model.tokenizer.save_pretrained(
+                        f"{train_config.save_path}/tokenizer"
+                    )
 
                 # load from checkpoint; merges any loras into base llm
                 if train_config.ckpt_path is not None:
@@ -142,17 +137,36 @@ def fsdp_main(model_config, **kwargs):
                         trainable=True,
                         merge_and_unload=False,  # keep lora from previous train iter
                     )
+                    # print(model)
 
             else:
                 with torch.device("meta"):
                     model = VLM(model_config, hf_token=TOKEN)
 
-        if train_config.enable_peft and not isinstance(model.vision, PeftModel):
+        # TODO: maybe switch to unified lora for whole model instead
+        if train_config.enable_peft_vision and not isinstance(model.vision, PeftModel):
             assert (
                 lora_config is not None
             ), "Either disable `enable_peft` or provide a valid lora config!"
-            # model.llm = get_peft_model(model.llm, lora_config)
-            model.vision = get_peft_model(model.vision, lora_config)
+            if rank == 0:
+                print("creating vision loras...")
+            if train_config.enable_peft_vision:
+                model.vision = get_peft_model(model.vision, lora_config)
+
+        if train_config.enable_peft_llm and not isinstance(model.llm, PeftModel):
+            assert (
+                lora_config is not None
+            ), "Either disable `enable_peft` or provide a valid lora config!"
+            if rank == 0:
+                print("creating llm loras...")
+            if train_config.enable_peft_llm:
+                model.llm = get_peft_model(model.llm, lora_config)
+
+        # model precision
+        if train_config.bfloat16:
+            model.to(torch.bfloat16)
+        elif train_config.fp16:
+            model.to(torch.float16)
 
         if rank == 0:
             params = sum((p.numel() for p in model.parameters()))
@@ -165,10 +179,12 @@ def fsdp_main(model_config, **kwargs):
             model,
             fsdp_config.transformer_cls,
         )
+
         model = FSDP(
             model,
             auto_wrap_policy=my_auto_wrapping_policy,
             sharding_strategy=fsdp_config.sharding_strategy,
+            mixed_precision=get_mixed_precision_policy(train_config, rank=rank),
             device_id=torch.cuda.current_device(),
             limit_all_gathers=True,
             sync_module_states=True,
@@ -182,6 +198,8 @@ def fsdp_main(model_config, **kwargs):
         # model.to(torch.float16) #nan
 
         if fsdp_config.fsdp_activation_checkpointing:
+            # might need to add stuff for lora with checkpointing
+            # https://github.com/meta-llama/llama-recipes/blob/main/src/llama_recipes/finetuning.py#L193
             policies.apply_fsdp_checkpointing(model)
 
     else:
@@ -218,18 +236,29 @@ def fsdp_main(model_config, **kwargs):
         },
     ]
 
-    optimizer = torch.optim.AdamW(  # type: ignore
-        optimizer_parameter_groups,
-        weight_decay=train_config.weight_decay,
-        betas=train_config.betas,
-    )
+    if train_config.fp16:
+        optimizer = AnyPrecisionAdamW(
+            optimizer_parameter_groups,
+            lr=train_config.mm_connector_lr,
+            betas=train_config.betas,
+            momentum_dtype=torch.bfloat16,
+            variance_dtype=torch.bfloat16,
+            compensation_buffer_dtype=torch.bfloat16,
+        )
+    else:
+        optimizer = torch.optim.AdamW(  # type: ignore
+            optimizer_parameter_groups,
+            weight_decay=train_config.weight_decay,
+            betas=train_config.betas,
+        )
 
+    # huggingface one
     if train_config.scheduler == "cosine_with_warmup":
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             int(train_config.warmup_ratio * len(train_dl) * train_config.n_epochs),
             len(train_dl) * train_config.n_epochs,
-            min_lr=train_config.min_lr,
+            # min_lr=train_config.min_lr,
         )
     elif train_config.scheduler == "constant_with_warmup":
         scheduler = get_constant_schedule_with_warmup(
@@ -242,6 +271,9 @@ def fsdp_main(model_config, **kwargs):
     else:
         # constant lr
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+    # sanity check to make sure we added new tokens
+    # print(model.tokenizer.added_tokens_decoder)
 
     # launch train
     train(
@@ -259,6 +291,7 @@ def fsdp_main(model_config, **kwargs):
 
 if __name__ == "__main__":
     setup()
+    from transformers import AddedToken
 
     ATTN_IMPLEMENTATION = "eager"
 
@@ -270,49 +303,54 @@ if __name__ == "__main__":
         grid=(1, 1),
         # sparsity_plugins=[BilinearConfig(size=(28, 28))],
         use_global_crop=False,
-        # perceiver_config=PerceiverResamplerConfig(
-        #     hidden_size=1152,
-        #     n_latents=128,
-        #     depth=3,
-        #     hidden_act="silu",
-        #     n_query_groups=1,
-        #     concat_latents_kv=False,
-        #     attn_implementation=ATTN_IMPLEMENTATION,
-        # ),
     )
+
+    # some additional tokens
+    # special_tokens = ["<|vision_start|>", "<|vision_end|>"]
+    # special_tokens += ["<|box_start|>", "<|box_end|>"] # change in datasets
+    # special_tokens += [f"0.{i}" for i in range(10)]
+    # special_tokens += [f"0.{i}{j}" for i in range(10) for j in range(1, 10)]
+    # special_tokens += ["1.0"]
 
     model_config = VLMConfig(
         vision_name_or_path="google/siglip-so400m-patch14-384",
-        text_name_or_path="Qwen/Qwen2.5-0.5B-Instruct",
-        # text_name_or_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        text_name_or_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # text_name_or_path="Qwen/Qwen2.5-0.5B-Instruct",
         vision_tower_config=vision_tower_config,
         vision_cls="SiglipVisionModel",
         freeze=True,
         attn_implementation=ATTN_IMPLEMENTATION,
-        bos_token="<|im_start|>user\n",
-        instruction_template="<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n",
-        response_template="{response}<|im_end|>",
+        bos_token="<|im_start|>user:\n",
+        instruction_template="<|im_start|>user:\n{instruction}<|im_end|>\n<|im_start|>assistant:\n",
+        response_template="{response}<|im_end|><|endoftext|>",
+        unfreeze_lm_head=False,
+        # special_tokens=special_tokens,
+        # lm_loss_lambda=1.0,
     )
 
     train_config = TrainConfig(
-        warmup_ratio=0.01,
+        warmup_ratio=0.03,
         batch_size=1,
-        gradient_accumulation_steps=16,
-        mm_connector_lr=3e-04,
-        llm_lr=3e-04,
-        weight_decay=0.1,
+        gradient_accumulation_steps=6,
+        mm_connector_lr=2e-04,
+        llm_lr=2e-04,
+        weight_decay=0.0,
         grad_clip=1.0,
-        save_steps=10000,
+        save_steps=2,
         do_eval=False,
         eval_steps=500,
-        log_steps=1,
-        save_path="/mnt/nate/model_checkpoints/ocr-theory-qwen2-grounded",
-        # ckpt_path="/mnt/nate/model_checkpoints/ocr-theory-qwen2-grounded/step20000",
+        log_steps=2,
+        # ckpt_path="/mnt/nate/model_checkpoints/ocr_pretrain_clone/epoch3_step10418",
+        save_path="/mnt/nate/model_checkpoints/test",
         betas=[0.9, 0.999],
-        scheduler="constant_with_warmup",  # "cosine_with_warmup"
+        scheduler="cosine_with_warmup",  # "constant_with_warmup",  # "cosine_with_warmup"
         fsdp=True,
-        enable_peft=True,
-        n_epochs=3,
+        enable_peft_llm=True,
+        enable_peft_vision=False,
+        n_epochs=4,
+        bfloat16=False,
+        fp16=True,
+        mixed_precision=True,
     )
 
     # need this for weight tying: torch.nn.Embedding, # if we upscale images we can't fsdp the positional embeddings ?
@@ -322,16 +360,17 @@ if __name__ == "__main__":
             SiglipEncoderLayer,
             Qwen2DecoderLayer,
             LlamaDecoderLayer,
-            PerceiverResampler,
-            torch.nn.modules.sparse.Embedding,
+            # PerceiverResampler,
+            # torch.nn.modules.sparse.Embedding,
+            # VisionTower,
         ),
         fsdp_activation_checkpointing=False,
         fsdp_cpu_offload=False,
-        sharding_strategy=ShardingStrategy.NO_SHARD,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
     )
 
     wandb_config = WandbConfig(
-        enable=True,
+        enable=False,
         project="ocr-theory",
         entity="nnethercott",
         name=model_config.text_name_or_path.split("/")[-1].lower()
@@ -341,8 +380,8 @@ if __name__ == "__main__":
         + str(uuid.uuid1()).split("-")[1],  # model-archi-uuid
     )
     lora_config = LoraConfig(
-        r=4,
-        lora_alpha=32,
+        r=32,
+        lora_alpha=128,
         target_modules=[
             "key",
             "query",
@@ -352,6 +391,10 @@ if __name__ == "__main__":
             "k_proj",
             "v_proj",
             "o_proj",
+            "up_proj",
+            "down_proj",
+            "fc1",
+            "fc2",
         ],
         bias="none",
     )
