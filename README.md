@@ -1,4 +1,9 @@
 # beni 
+`beni` is a repo for mixing and matching vision backbones with LLMs to align text and vision embedding spaces. This gives the llm an "understanding" of images. For more technical details on this process check out [this blog post](https://medium.com/@natenethercott/vision-language-models-from-scratch-in-colab-cd073a753b8a). 
+
+Here's some results you can get in an hour: 
+![image (5)](https://github.com/user-attachments/assets/bc5b6ecd-07d4-47a4-a984-1ad34c7bf38d)
+
 ## resources
 ### repos
 * [llama-recipes](https://github.com/meta-llama/llama-recipes) (fsdp tools, activation checkpointing, mixed precision, wrapper for lora, overall holy grail)
